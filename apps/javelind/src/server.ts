@@ -3,6 +3,7 @@ import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type {
   CommitSummary,
+  SearchResponse,
   FetchObjectsResponse,
   ListRefsResponse,
   ListReposResponse,
@@ -15,6 +16,7 @@ import type {
   UploadObjectsResponse,
 } from "@javelin/protocol";
 import { isObjectId, objectId, type ObjectId } from "@javelin/protocol";
+import { indexCommit, searchCode, searchHistory, searchProvenance } from "@javelin/search";
 import { encodeObject, hashEncoding, Repository, type StoredObject } from "@javelin/vcs";
 
 export interface JavelindOptions {
@@ -86,8 +88,26 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
   await rename(tmp, path);
 }
 
-/** Serializes ref updates per repo so CAS read-then-write cannot interleave. */
-class RepoLocks {
+type SearchKind = "code" | "history" | "provenance";
+
+async function dispatchSearch(
+  repo: Repository,
+  kind: SearchKind,
+  query: string,
+  limit: number,
+  head: ObjectId,
+): Promise<SearchResponse["hits"]> {
+  switch (kind) {
+    case "history":
+      return searchHistory(repo, query, limit);
+    case "provenance":
+      return searchProvenance(repo, query, limit);
+    default:
+      return searchCode(repo, query, limit, head);
+  }
+}
+
+/** Serializes ref updates per repo so CAS read-then-write cannot interleave. */class RepoLocks {
   private locks = new Map<string, Promise<unknown>>();
 
   async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -102,6 +122,7 @@ export function createServer(opts: JavelindOptions): JavelindServer {
   const root = opts.root;
   mkdirSync(root, { recursive: true });
   const locks = new RepoLocks();
+  const pendingIndex = new Map<string, Promise<void>>();
 
   const repoDir = (name: string) => join(root, name);
   const metaPath = (name: string) => join(root, name, ".javelin", "meta.json");
@@ -163,6 +184,14 @@ export function createServer(opts: JavelindOptions): JavelindServer {
       return { ref, ok: false, reason: "non-fast-forward", detail: `${ref} is at ${current}` };
     }
     return repo.refs.set(ref, newId, u.expectedOld);
+  }
+
+  async function resolveHead(repo: Repository): Promise<ObjectId | null> {
+    try {
+      return await repo.resolveToCommit(await repo.currentBranch());
+    } catch {
+      return null;
+    }
   }
 
   function commitSummary(id: ObjectId, commit: Extract<StoredObject, { kind: "commit" }>): CommitSummary {
@@ -293,6 +322,15 @@ export function createServer(opts: JavelindOptions): JavelindServer {
           }
           return out;
         });
+        for (let i = 0; i < results.length; i++) {
+          const newId = (updates as RefUpdate[])[i]!.new;
+          if (results[i]!.ok && newId) {
+            const task = indexCommit(repo, newId).catch(() => {}).then(() => {
+              pendingIndex.delete(name);
+            });
+            pendingIndex.set(name, (pendingIndex.get(name) ?? Promise.resolve()).then(() => task));
+          }
+        }
         const res: UpdateRefsResponse = { results };
         return json(res);
       }
@@ -313,10 +351,24 @@ export function createServer(opts: JavelindOptions): JavelindServer {
       }
 
       if (tail === "search" && method === "POST") {
-        await openRepo(name);
+        const repo = await openRepo(name);
+        await pendingIndex.get(name);
         const body = await readJsonBody(req);
-        requireString(body, "query");
-        return json({ hits: [] });
+        const query = requireString(body, "query");
+        const kind = body.kind === undefined || body.kind === "code" || body.kind === "history" || body.kind === "provenance" ? (body.kind ?? "code") : null;
+        if (!kind) throw new HttpError(400, "bad_request", `invalid kind: ${String(body.kind)}`);
+        const limit = typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : 20;
+        let commitId: ObjectId | undefined;
+        if (body.commitId !== undefined) {
+          if (typeof body.commitId !== "string" || !isObjectId(body.commitId)) {
+            throw new HttpError(400, "bad_request", "commitId must be a hex object id");
+          }
+          commitId = objectId(body.commitId);
+        }
+        const head = commitId ?? (await resolveHead(repo));
+        const hits = head === null ? [] : await dispatchSearch(repo, kind, query, limit, head);
+        const res: SearchResponse = { hits };
+        return json(res);
       }
     }
 
