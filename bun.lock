@@ -20,6 +20,14 @@
         "@javelin/vcs": "workspace:*",
       },
     },
+    "packages/git-bridge": {
+      "name": "@javelin/git-bridge",
+      "version": "0.1.0",
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
+    },
     "packages/protocol": {
       "name": "@javelin/protocol",
       "version": "0.1.0",
@@ -56,6 +64,8 @@
     },
   },
   "packages": {
+    "@javelin/git-bridge": ["@javelin/git-bridge@workspace:packages/git-bridge"],
+
     "@javelin/javelind": ["@javelin/javelind@workspace:apps/javelind"],
 
     "@javelin/protocol": ["@javelin/protocol@workspace:packages/protocol"],
