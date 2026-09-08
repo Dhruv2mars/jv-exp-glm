@@ -1,6 +1,6 @@
 import { JavelinClient } from "@javelin/sdk";
 import { notFound, page } from "./html";
-import { renderBrowse, renderBlob, renderCommit, renderCommits, renderHome, renderRepoSummary, renderSearch } from "./pages";
+import { renderBrowse, renderBlob, renderCommit, renderCommits, renderHome, renderRepoSummary, renderSearch, parseSearchKind } from "./pages";
 import { NotFound, REPO_NAME, resolveCommit } from "./repo";
 
 export interface WebServerOptions {
@@ -63,7 +63,8 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       const repo = seg[0]!;
       const q = url.searchParams.get("q") ?? "";
       const ref = url.searchParams.get("ref") ?? (await defaultRef(client, repo));
-      return html(await renderSearch(client, repo, q, ref));
+      const kind = parseSearchKind(url.searchParams.get("kind"));
+      return html(await renderSearch(client, repo, q, ref, kind));
     }
 
     throw new NotFound(`no page: ${method} ${url.pathname}`);
@@ -81,8 +82,10 @@ export function createWebServer(opts: WebServerOptions): WebServer {
         return await handle(req, new URL(req.url));
       } catch (e) {
         if (e instanceof NotFound) return html(notFound(e.message), 404);
-        if (e instanceof Error && e.name === "JrpError" && "status" in e && (e as { status: number }).status === 404) {
-          return html(notFound(e.message), 404);
+        if (e instanceof Error && e.name === "JrpError" && "status" in e) {
+          const status = (e as { status: number }).status;
+          if (status === 404) return html(notFound(e.message), 404);
+          if (status === 400) return html(page("Bad request", `<div class="error"><div class="code">400</div><p>${e.message.replace(/[&<>"']/g, "")}</p></div>`), 400);
         }
         const message = e instanceof Error ? e.message : String(e);
         return html(page("Error", `<div class="error"><div class="code">500</div><p>${message.replace(/[&<>"']/g, "")}</p></div>`), 500);

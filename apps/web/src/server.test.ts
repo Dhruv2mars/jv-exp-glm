@@ -118,6 +118,28 @@ describe("javelin web", () => {
     const body = await res.text();
     expect(body).toContain("src/nested.txt");
     expect(body).toContain("nested content alpha");
+    expect(body).toContain('href="/demo/blob/');
+  });
+
+  test("search with kind=history finds commit messages", async () => {
+    const res = await fetch(`${base}/demo/search?q=update+hello&kind=history`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("update hello");
+  });
+
+  test("empty query renders the form without results", async () => {
+    const res = await fetch(`${base}/demo/search`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("Search in demo");
+    expect(body).not.toContain('class="hit"');
+  });
+
+  test("no-hit query renders the empty state", async () => {
+    const res = await fetch(`${base}/demo/search?q=zzz-no-such-needle-zzz`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("No matches.");
   });
 
   test("unknown repo returns 404", async () => {
