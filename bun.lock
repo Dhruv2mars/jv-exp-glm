@@ -20,6 +20,15 @@
         "@javelin/vcs": "workspace:*",
       },
     },
+    "packages/agents": {
+      "name": "@javelin/agents",
+      "version": "0.1.0",
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/provenance": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
+    },
     "packages/protocol": {
       "name": "@javelin/protocol",
       "version": "0.1.0",
@@ -56,6 +65,8 @@
     },
   },
   "packages": {
+    "@javelin/agents": ["@javelin/agents@workspace:packages/agents"],
+
     "@javelin/javelind": ["@javelin/javelind@workspace:apps/javelind"],
 
     "@javelin/protocol": ["@javelin/protocol@workspace:packages/protocol"],
