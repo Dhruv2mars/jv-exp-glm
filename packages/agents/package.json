@@ -1,11 +1,11 @@
 {
-  "name": "@javelin/javelind",
+  "name": "@javelin/agents",
   "version": "0.1.0",
   "type": "module",
-  "bin": { "javelind": "./src/main.ts" },
+  "exports": { ".": "./src/index.ts" },
   "dependencies": {
     "@javelin/protocol": "workspace:*",
-    "@javelin/search": "workspace:*",
+    "@javelin/provenance": "workspace:*",
     "@javelin/vcs": "workspace:*"
   }
 }

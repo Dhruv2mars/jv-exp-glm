@@ -1,11 +1,13 @@
 {
-  "name": "@javelin/javelind",
+  "name": "@javelin/web",
   "version": "0.1.0",
   "type": "module",
-  "bin": { "javelind": "./src/main.ts" },
+  "bin": { "javelin-web": "./src/main.ts" },
   "dependencies": {
     "@javelin/protocol": "workspace:*",
-    "@javelin/search": "workspace:*",
+    "@javelin/sdk": "workspace:*"
+  },
+  "devDependencies": {
     "@javelin/vcs": "workspace:*"
   }
 }
