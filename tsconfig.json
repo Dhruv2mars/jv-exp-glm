@@ -13,5 +13,5 @@
       "@javelin/protocol": ["./packages/protocol/src/index.ts"]
     }
   },
-  "include": ["packages/*/src/**/*.ts", "apps/*/src/**/*.ts", "scripts/**/*.ts"]
+  "include": ["packages/*/src/**/*.ts", "apps/*/src/**/*.ts", "scripts/**/*.ts", "ops/**/*.ts"]
 }
