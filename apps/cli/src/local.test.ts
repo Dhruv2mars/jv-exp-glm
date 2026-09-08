@@ -3,6 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cmdAdd, cmdBranch, cmdCheckout, cmdCommit, cmdDiff, cmdInit, cmdLog, cmdMerge, cmdStatus } from "./local";
+import { cmdRemoteAdd } from "./remote";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 
 let root: string;
 
@@ -76,4 +78,12 @@ describe("local-only flow", () => {
   test("checkout an unknown ref fails", async () => {
     expect(cmdCheckout(root, "nope")).rejects.toThrow("cannot resolve");
   });
+});
+
+test("parseArgs normalizes long-flag keys so --token reaches remote add", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "javelin-cli-"));
+  const root = await cmdInit(dir);
+  await cmdRemoteAdd(root, "origin", "http://localhost:47990/demo", "tok123");
+  const config = JSON.parse(await readFile(join(root, ".javelin", "config.json"), "utf8"));
+  expect(config.remotes.origin.token).toBe("tok123");
 });

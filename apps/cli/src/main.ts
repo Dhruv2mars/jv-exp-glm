@@ -12,11 +12,12 @@ function parseArgs(args: string[], flags: string[]): ParsedArgs {
   const options = new Map<string, string>();
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
-    const flag = flags.find((f) => arg === f || arg === `--${f.replace(/^-/, "")}`);
+    const name = arg.replace(/^-+/, "");
+    const flag = flags.find((f) => f.replace(/^-+/, "") === name);
     if (flag) {
       const value = args[++i];
       if (value === undefined) throw new Error(`missing value for ${arg}`);
-      options.set(flag.replace(/^-/, ""), value);
+      options.set(flag.replace(/^-+/, ""), value);
     } else {
       positional.push(arg);
     }
