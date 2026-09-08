@@ -1,0 +1,26 @@
+# Run from the repository root:
+#   docker compose -f ops/docker-compose.yml up --build
+services:
+  javelind:
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - javelind-data:/data
+    # Uncomment to require bearer tokens on JRP requests:
+    # environment:
+    #   JAVELIND_TOKEN: change-me
+  web:
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile.web
+    ports:
+      - "3000:3000"
+    environment:
+      JAVELIND_URL: http://javelind:8080
+    depends_on:
+      - javelind
+volumes:
+  javelind-data:
