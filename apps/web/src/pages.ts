@@ -1,5 +1,5 @@
 import type { JavelinClient } from "@javelin/sdk";
-import { objectId, type ObjectId } from "@javelin/protocol";
+import type { SearchHit } from "@javelin/protocol";
 import { esc, notFound, page } from "./html";
 import {
   asCommit,
@@ -9,7 +9,6 @@ import {
   listTreeFiles,
   lookupPath,
   NotFound,
-  ObjMap,
   resolveCommit,
 } from "./repo";
 
@@ -228,61 +227,45 @@ export async function renderBlob(
   return renderBlobContent(client, repo, ref, segments, decodeBlob(objects.get(hit.id)));
 }
 
-export async function renderSearch(client: JavelinClient, repo: string, query: string, ref: string): Promise<string> {
-  const results = query
-    ? await searchCode(client, repo, ref, query)
-    : [];
+const SEARCH_KINDS = ["code", "history", "provenance"] as const;
+export type SearchKind = (typeof SEARCH_KINDS)[number];
+
+export function parseSearchKind(value: string | null): SearchKind {
+  return (SEARCH_KINDS as readonly string[]).includes(value ?? "") ? (value as SearchKind) : "code";
+}
+
+export async function renderSearch(client: JavelinClient, repo: string, query: string, ref: string, kind: SearchKind): Promise<string> {
+  let results: SearchHit[] = [];
+  let error: string | null = null;
+  if (query) {
+    try {
+      results = (await client.search(repo, query, { kind })).hits;
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
   const hits = results
-    .map(
-      (h) => `<div class="hit">
-  <a href="/${esc(repo)}/blob/${esc(ref)}/${esc(h.path)}">${esc(h.path)}</a>
-  <pre>${esc(h.snippet)}</pre>
-</div>`,
-    )
+    .map((h) => {
+      const at = h.commit ?? ref;
+      return `<div class="hit">
+  <a href="/${esc(repo)}/blob/${esc(at)}/${esc(h.path ?? "")}">${esc(h.path ?? at)}</a>
+  ${h.snippet ? `<pre>${esc(h.snippet)}</pre>` : ""}
+</div>`;
+    })
     .join("\n");
   return page(
     `Search ${repo}`,
     `<h1>Search in ${esc(repo)}</h1>
 <form class="inline" method="get" action="/${esc(repo)}/search">
-  <input type="text" name="q" value="${esc(query)}" placeholder="Search code…">
+  <input type="text" name="q" value="${esc(query)}" placeholder="Search ${esc(repo)}…">
+  <select name="kind">
+    ${SEARCH_KINDS.map((k) => `<option value="${k}"${k === kind ? " selected" : ""}>${k}</option>`).join("\n    ")}
+  </select>
   <button type="submit">Search</button>
 </form>
-${query ? `<p class="muted">${results.length} match${results.length === 1 ? "" : "es"} for “${esc(query)}”</p>${hits || "<p class=\"muted\">No matches.</p>"}` : ""}
+${error ? `<div class="error"><p>${esc(error)}</p></div>` : ""}
+${query ? `<p class="muted">${results.length} match${results.length === 1 ? "" : "es"} for “${esc(query)}” (${esc(kind)})</p>${hits || "<p class=\"muted\">No matches.</p>"}` : ""}
 `,
     { repo, tab: "search" },
   );
-}
-
-interface CodeHit {
-  path: string;
-  snippet: string;
-}
-
-/**
- * javelind's search endpoint does not index content yet, so this greps the
- * head tree blobs fetched through the SDK. Everything still goes over JRP.
- */
-export async function searchCode(client: JavelinClient, repo: string, ref: string, query: string): Promise<CodeHit[]> {
-  const commitId = await resolveCommit(client, repo, ref);
-  const commit = asCommit((await fetchObjects(client, repo, [commitId])).get(commitId));
-  if (!commit) return [];
-  const files = await listTreeFiles(client, repo, commit.tree);
-  const ids = [...new Set([...files.values()].map(String))];
-  const objects: ObjMap = new Map();
-  for (let i = 0; i < ids.length; i += 100) {
-    for (const o of (await client.fetchObjects(repo, ids.slice(i, i + 100) as ObjectId[])).objects) objects.set(o.id, o);
-  }
-  const needle = query.toLowerCase();
-  const hits: CodeHit[] = [];
-  for (const [path, id] of files) {
-    const data = decodeBlob(objects.get(String(id)));
-    if (data === null || data.length > 512 * 1024) continue;
-    const lineIdx = data.split("\n").findIndex((l) => l.toLowerCase().includes(needle));
-    if (lineIdx < 0) continue;
-    const lines = data.split("\n");
-    const from = Math.max(0, lineIdx - 1);
-    hits.push({ path, snippet: lines.slice(from, lineIdx + 2).join("\n") });
-    if (hits.length >= 50) break;
-  }
-  return hits;
 }
