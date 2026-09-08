@@ -25,6 +25,31 @@ bun test        # run the full test suite
 bun run build   # build all packages
 ```
 
+Start the repository server and the web app:
+
+```sh
+bun run apps/javelind/src/main.ts --port 8080 --root ./javelind-data
+bun run apps/web/src/main.ts --javelind http://localhost:8080 --port 3000
+```
+
+Use the CLI against the running server (set `JAVELIN_TOKEN` if javelind was started with `JAVELIND_TOKEN`):
+
+```sh
+bun run apps/cli/src/main.ts clone http://localhost:8080/myrepo myrepo
+bun run apps/cli/src/main.ts add .   # from inside myrepo
+bun run apps/cli/src/main.ts commit -m "first change"
+bun run apps/cli/src/main.ts push origin
+```
+
+Back up and restore a javelind root:
+
+```sh
+bun run ops/backup.ts --root ./javelind-data --archive ./backups
+bun run ops/restore.ts --archive ./backups/<timestamp> --root ./restored-data
+```
+
+See `docs/operations.md` for token auth, Docker Compose deployment, and operational limitations.
+
 ## Documentation
 
 - `docs/brief.md` — the product brief
