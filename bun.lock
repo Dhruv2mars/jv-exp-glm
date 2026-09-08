@@ -9,6 +9,17 @@
         "typescript": "^7.0.2",
       },
     },
+    "apps/javelind": {
+      "name": "@javelin/javelind",
+      "version": "0.1.0",
+      "bin": {
+        "javelind": "./src/main.ts",
+      },
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
+    },
     "packages/git-bridge": {
       "name": "@javelin/git-bridge",
       "version": "0.1.0",
@@ -21,11 +32,27 @@
       "name": "@javelin/protocol",
       "version": "0.1.0",
     },
+    "packages/provenance": {
+      "name": "@javelin/provenance",
+      "version": "0.1.0",
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
+    },
     "packages/sdk": {
       "name": "@javelin/sdk",
       "version": "0.1.0",
       "dependencies": {
         "@javelin/protocol": "workspace:*",
+      },
+    },
+    "packages/search": {
+      "name": "@javelin/search",
+      "version": "0.1.0",
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/vcs": "workspace:*",
       },
     },
     "packages/vcs": {
@@ -39,9 +66,15 @@
   "packages": {
     "@javelin/git-bridge": ["@javelin/git-bridge@workspace:packages/git-bridge"],
 
+    "@javelin/javelind": ["@javelin/javelind@workspace:apps/javelind"],
+
     "@javelin/protocol": ["@javelin/protocol@workspace:packages/protocol"],
 
+    "@javelin/provenance": ["@javelin/provenance@workspace:packages/provenance"],
+
     "@javelin/sdk": ["@javelin/sdk@workspace:packages/sdk"],
+
+    "@javelin/search": ["@javelin/search@workspace:packages/search"],
 
     "@javelin/vcs": ["@javelin/vcs@workspace:packages/vcs"],
 
