@@ -5,6 +5,7 @@
   "bin": { "javelind": "./src/main.ts" },
   "dependencies": {
     "@javelin/protocol": "workspace:*",
+    "@javelin/search": "workspace:*",
     "@javelin/vcs": "workspace:*"
   }
 }

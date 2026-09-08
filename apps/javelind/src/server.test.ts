@@ -112,8 +112,48 @@ describe("javelind", () => {
     expect(logBody.commits.map((c) => c.id)).toEqual([c2, c1]);
     expect(logBody.commits[0]!.message).toBe("commit 1");
 
-    const search = await request(t.url, "POST", "/jrp/v1/repos/demo/search", { query: "x" });
+    const search = await request(t.url, "POST", "/jrp/v1/repos/demo/search", { query: "zzz" });
     expect(await search.json()).toEqual({ hits: [] });
+  });
+
+  test("search: code hits indexed files, history finds commit messages, unknown repo 404", async () => {
+    const t = await startServer();
+    servers.push(t);
+    const { objects, ids } = await buildClientRepo(2);
+    const c2 = ids[1]!;
+    await request(t.url, "POST", "/jrp/v1/repos", { name: "s1" });
+    await request(t.url, "POST", "/jrp/v1/repos/s1/objects/upload", { objects });
+    const refsUpdate = await request(t.url, "POST", "/jrp/v1/repos/s1/refs/update", {
+      updates: [{ ref: "refs/heads/main", expectedOld: null, new: c2 }],
+    });
+    expect(((await refsUpdate.json()) as UpdateRefsResponse).results[0]!.ok).toBe(true);
+
+    const code = await request(t.url, "POST", "/jrp/v1/repos/s1/search", { query: "content 1" });
+    expect(code.status).toBe(200);
+    const codeBody = (await code.json()) as { hits: { kind: string; path?: string; commit?: string }[] };
+    expect(codeBody.hits.length).toBeGreaterThan(0);
+    expect(codeBody.hits[0]!.path).toBe("f1.txt");
+    expect(codeBody.hits[0]!.commit).toBe(c2);
+
+    const byCommit = await request(t.url, "POST", "/jrp/v1/repos/s1/search", { query: "content 0", commitId: c2 });
+    const byCommitBody = (await byCommit.json()) as { hits: { path?: string; commit?: string }[] };
+    expect(byCommitBody.hits[0]!.path).toBe("f0.txt");
+    expect(byCommitBody.hits[0]!.commit).toBe(c2);
+
+    const history = await request(t.url, "POST", "/jrp/v1/repos/s1/search", { query: "commit 0", kind: "history" });
+    const historyBody = (await history.json()) as { hits: { kind: string; commit?: string }[] };
+    expect(historyBody.hits[0]!.kind).toBe("history");
+    expect(historyBody.hits[0]!.commit).toBe(ids[0]);
+
+    const badKind = await request(t.url, "POST", "/jrp/v1/repos/s1/search", { query: "x", kind: "nope" });
+    expect(badKind.status).toBe(400);
+
+    const missing = await request(t.url, "POST", "/jrp/v1/repos/s1/search", { query: "content 1", commitId: "b".repeat(64) });
+    expect(await missing.json()).toEqual({ hits: [] });
+
+    const unknown = await request(t.url, "POST", "/jrp/v1/repos/nope/search", { query: "content 1" });
+    expect(unknown.status).toBe(404);
+    expect(((await unknown.json()) as { error: { code: string } }).error.code).toBe("not_found");
   });
 
   test("cas-mismatch and non-fast-forward rejection", async () => {
