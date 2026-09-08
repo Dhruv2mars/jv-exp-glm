@@ -9,9 +9,28 @@
         "typescript": "^7.0.2",
       },
     },
+    "apps/javelind": {
+      "name": "@javelin/javelind",
+      "version": "0.1.0",
+      "bin": {
+        "javelind": "./src/main.ts",
+      },
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
+    },
     "packages/protocol": {
       "name": "@javelin/protocol",
       "version": "0.1.0",
+    },
+    "packages/provenance": {
+      "name": "@javelin/provenance",
+      "version": "0.1.0",
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
     },
     "packages/sdk": {
       "name": "@javelin/sdk",
@@ -37,7 +56,11 @@
     },
   },
   "packages": {
+    "@javelin/javelind": ["@javelin/javelind@workspace:apps/javelind"],
+
     "@javelin/protocol": ["@javelin/protocol@workspace:packages/protocol"],
+
+    "@javelin/provenance": ["@javelin/provenance@workspace:packages/provenance"],
 
     "@javelin/sdk": ["@javelin/sdk@workspace:packages/sdk"],
 
