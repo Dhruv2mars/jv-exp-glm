@@ -9,6 +9,18 @@
         "typescript": "^7.0.2",
       },
     },
+    "apps/cli": {
+      "name": "@javelin/cli",
+      "version": "0.1.0",
+      "bin": {
+        "javelin": "./src/main.ts",
+      },
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/sdk": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
+    },
     "apps/javelind": {
       "name": "@javelin/javelind",
       "version": "0.1.0",
@@ -56,6 +68,8 @@
     },
   },
   "packages": {
+    "@javelin/cli": ["@javelin/cli@workspace:apps/cli"],
+
     "@javelin/javelind": ["@javelin/javelind@workspace:apps/javelind"],
 
     "@javelin/protocol": ["@javelin/protocol@workspace:packages/protocol"],

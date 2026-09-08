@@ -1,0 +1,11 @@
+{
+  "name": "@javelin/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": { "javelin": "./src/main.ts" },
+  "dependencies": {
+    "@javelin/protocol": "workspace:*",
+    "@javelin/sdk": "workspace:*",
+    "@javelin/vcs": "workspace:*"
+  }
+}
