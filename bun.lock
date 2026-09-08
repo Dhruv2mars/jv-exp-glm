@@ -28,6 +28,14 @@
         "@javelin/vcs": "workspace:*",
       },
     },
+    "packages/policy": {
+      "name": "@javelin/policy",
+      "version": "0.1.0",
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
+    },
     "packages/protocol": {
       "name": "@javelin/protocol",
       "version": "0.1.0",
@@ -67,6 +75,8 @@
     "@javelin/git-bridge": ["@javelin/git-bridge@workspace:packages/git-bridge"],
 
     "@javelin/javelind": ["@javelin/javelind@workspace:apps/javelind"],
+
+    "@javelin/policy": ["@javelin/policy@workspace:packages/policy"],
 
     "@javelin/protocol": ["@javelin/protocol@workspace:packages/protocol"],
 
