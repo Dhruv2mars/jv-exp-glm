@@ -1,0 +1,10 @@
+{
+  "name": "@javelin/javelind",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": { "javelind": "./src/main.ts" },
+  "dependencies": {
+    "@javelin/protocol": "workspace:*",
+    "@javelin/vcs": "workspace:*"
+  }
+}
