@@ -17,6 +17,16 @@
       },
       "dependencies": {
         "@javelin/protocol": "workspace:*",
+        "@javelin/search": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
+    },
+    "packages/agents": {
+      "name": "@javelin/agents",
+      "version": "0.1.0",
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/provenance": "workspace:*",
         "@javelin/vcs": "workspace:*",
       },
     },
@@ -72,6 +82,8 @@
     },
   },
   "packages": {
+    "@javelin/agents": ["@javelin/agents@workspace:packages/agents"],
+
     "@javelin/git-bridge": ["@javelin/git-bridge@workspace:packages/git-bridge"],
 
     "@javelin/javelind": ["@javelin/javelind@workspace:apps/javelind"],
