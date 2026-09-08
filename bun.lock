@@ -9,6 +9,18 @@
         "typescript": "^7.0.2",
       },
     },
+    "apps/cli": {
+      "name": "@javelin/cli",
+      "version": "0.1.0",
+      "bin": {
+        "javelin": "./src/main.ts",
+      },
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/sdk": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
+    },
     "apps/javelind": {
       "name": "@javelin/javelind",
       "version": "0.1.0",
@@ -18,6 +30,20 @@
       "dependencies": {
         "@javelin/protocol": "workspace:*",
         "@javelin/search": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
+    },
+    "apps/web": {
+      "name": "@javelin/web",
+      "version": "0.1.0",
+      "bin": {
+        "javelin-web": "./src/main.ts",
+      },
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/sdk": "workspace:*",
+      },
+      "devDependencies": {
         "@javelin/vcs": "workspace:*",
       },
     },
@@ -84,6 +110,8 @@
   "packages": {
     "@javelin/agents": ["@javelin/agents@workspace:packages/agents"],
 
+    "@javelin/cli": ["@javelin/cli@workspace:apps/cli"],
+
     "@javelin/git-bridge": ["@javelin/git-bridge@workspace:packages/git-bridge"],
 
     "@javelin/javelind": ["@javelin/javelind@workspace:apps/javelind"],
@@ -99,6 +127,8 @@
     "@javelin/search": ["@javelin/search@workspace:packages/search"],
 
     "@javelin/vcs": ["@javelin/vcs@workspace:packages/vcs"],
+
+    "@javelin/web": ["@javelin/web@workspace:apps/web"],
 
     "@types/bun": ["@types/bun@1.4.2", "", { "dependencies": { "bun-types": "1.4.2" } }, "sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ=="],
 
