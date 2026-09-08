@@ -13,9 +13,37 @@
       "name": "@javelin/protocol",
       "version": "0.1.0",
     },
+    "packages/sdk": {
+      "name": "@javelin/sdk",
+      "version": "0.1.0",
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+      },
+    },
+    "packages/search": {
+      "name": "@javelin/search",
+      "version": "0.1.0",
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+        "@javelin/vcs": "workspace:*",
+      },
+    },
+    "packages/vcs": {
+      "name": "@javelin/vcs",
+      "version": "0.1.0",
+      "dependencies": {
+        "@javelin/protocol": "workspace:*",
+      },
+    },
   },
   "packages": {
     "@javelin/protocol": ["@javelin/protocol@workspace:packages/protocol"],
+
+    "@javelin/sdk": ["@javelin/sdk@workspace:packages/sdk"],
+
+    "@javelin/search": ["@javelin/search@workspace:packages/search"],
+
+    "@javelin/vcs": ["@javelin/vcs@workspace:packages/vcs"],
 
     "@types/bun": ["@types/bun@1.4.2", "", { "dependencies": { "bun-types": "1.4.2" } }, "sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ=="],
 
