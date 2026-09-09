@@ -46,7 +46,7 @@ export interface LogEntry {
 
 export interface MergeConflict {
   path: string;
-  kind: "content" | "add-add" | "delete-modify";
+  kind: "content" | "add-add" | "delete-modify" | "binary";
   baseId: ObjectId | null;
   oursId: ObjectId | null;
   theirsId: ObjectId | null;
@@ -116,6 +116,15 @@ function person(author?: Author): Person {
 
 function worldValue(id: ObjectId | null): string {
   return JSON.stringify({ value: id });
+}
+
+/** Git's heuristic: content with a NUL byte in the first 8k is binary, not text. */
+function isBinary(bytes: Uint8Array): boolean {
+  const end = Math.min(bytes.length, 8192);
+  for (let i = 0; i < end; i++) {
+    if (bytes[i] === 0) return true;
+  }
+  return false;
 }
 
 export class Repository {
@@ -616,9 +625,17 @@ export class Repository {
         continue;
       }
       const mode: FileMode = o.mode !== b.mode ? o.mode : t.mode;
-      const decode = async (id: ObjectId): Promise<string[]> =>
-        splitLines(new TextDecoder().decode(await this.readBlob(id)));
-      const [baseLines, ourLines, theirLines] = await Promise.all([decode(b.id), decode(o.id), decode(t.id)]);
+      const [baseBytes, ourBytes, theirBytes] = await Promise.all([
+        this.readBlob(b.id),
+        this.readBlob(o.id),
+        this.readBlob(t.id),
+      ]);
+      if (isBinary(baseBytes) || isBinary(ourBytes) || isBinary(theirBytes)) {
+        conflicts.push({ path, kind: "binary", baseId: b.id, oursId: o.id, theirsId: t.id });
+        continue;
+      }
+      const decode = (bytes: Uint8Array): string[] => splitLines(new TextDecoder().decode(bytes));
+      const [baseLines, ourLines, theirLines] = [decode(baseBytes), decode(ourBytes), decode(theirBytes)];
       const merged = diff3(baseLines, ourLines, theirLines);
       if (!merged.lines) {
         conflicts.push({ path, kind: "content", baseId: b.id, oursId: o.id, theirsId: t.id });
