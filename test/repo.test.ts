@@ -1,6 +1,6 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test'
 import { join } from 'node:path'
-import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync, chmodSync, symlinkSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync, chmodSync, symlinkSync, appendFileSync } from 'node:fs'
 import { Repo, RepositoryError } from '../src/core/repo.ts'
 import { objectCount } from '../src/core/objects.ts'
 import { Oid } from '../src/core/oids.ts'
@@ -319,6 +319,95 @@ describe('stack', () => {
     const ws = join(dir, '.javelin', 'workspaces', 'integrator')
     expect(readFileSync(join(ws, 'a.txt'), 'utf8')).toBe('a-parent\n')
     expect(readFileSync(join(ws, 'b.txt'), 'utf8')).toBe('b-child\n')
+  })
+})
+
+describe('review regressions', () => {
+  test('a directory replaced by a file publishes cleanly', async () => {
+    const { repo, dir } = await initRepo('regress-dir-to-file', { 'a/inner.txt': 'x\n' })
+    await repo.layerCreate('work')
+    const ws = join(dir, '.javelin', 'workspaces', 'work')
+    rmSync(join(ws, 'a'), { recursive: true })
+    writeFileSync(join(ws, 'a'), 'now a file\n')
+    const result = repo.publish('work')
+    expect(result.status).toBe('published')
+    const files = repo.trees.listFiles(OidOf(repo.worldRecord().codeTree))
+    expect([...files.keys()]).toEqual(['a'])
+    expect(files.get('a')!.kind).toBe('file')
+  })
+
+  test('a broken symlink stays present and stable across seals', async () => {
+    const { repo, dir } = await initRepo('regress-broken-link', { 'real.txt': 'r\n' })
+    await repo.layerCreate('work')
+    const ws = join(dir, '.javelin', 'workspaces', 'work')
+    symlinkSync('/definitely/missing/target', join(ws, 'stub'))
+    repo.seal('work')
+    const afterFirst = repo.trees.listFiles(OidOf(repo.layer('work').savedRoot!))
+    expect(afterFirst.has('stub')).toBe(true)
+    repo.seal('work')
+    const afterSecond = repo.trees.listFiles(OidOf(repo.layer('work').savedRoot!))
+    expect(afterSecond.has('stub')).toBe(true)
+  })
+
+  test('directory-only ignore rules prune new directories', async () => {
+    const { repo, dir } = await initRepo('regress-dir-ignore', { 'keep.txt': 'k\n' })
+    writeFileSync(join(dir, '.javelinignore'), 'logs/\nnode_modules/\n')
+    await repo.layerCreate('work')
+    const ws = join(dir, '.javelin', 'workspaces', 'work')
+    mkdirSync(join(ws, 'logs'), { recursive: true })
+    mkdirSync(join(ws, 'node_modules', 'pkg'), { recursive: true })
+    writeFileSync(join(ws, 'logs', 'out.log'), 'noise\n')
+    writeFileSync(join(ws, 'node_modules', 'pkg', 'index.js'), 'module\n')
+    const { changes } = repo.seal('work')
+    expect(changes.size).toBe(0)
+  })
+
+  test('a running operation file from a dead process is adopted, not wedged', async () => {
+    const { repo, dir } = await initRepo('regress-ops-adopt', { 'a.txt': 'v1\n' })
+    await repo.layerCreate('w')
+    mkdirSync(join(dir, '.javelin', 'ops'), { recursive: true })
+    writeFileSync(
+      join(dir, '.javelin', 'ops', 'crash-1.json'),
+      JSON.stringify({ status: 'running', pid: 999_999_999, at: new Date().toISOString() }),
+    )
+    const result = repo.publish('w', { operationId: 'crash-1' })
+    expect(result.status).toBe('published')
+    const replay = repo.publish('w', { operationId: 'crash-1' })
+    expect(replay).toEqual(result)
+    expect(repo.history()).toHaveLength(2)
+  })
+
+  test('a failed publish without mutation releases its operation id', async () => {
+    const { repo, dir } = await initRepo('regress-ops-release', { 'a.txt': 'v1\n' })
+    await repo.layerCreate('bot', { agent: { type: 'codex', sessionId: 's-1' } })
+    writeFileSync(join(dir, '.javelin', 'workspaces', 'bot', 'a.txt'), 'v2\n')
+    expect(() => repo.publish('bot', { operationId: 'doomed' })).toThrow(RepositoryError)
+    // The same id works again once the condition is resolved.
+    writeFileSync(join(dir, 'trace.jsonl'), '{"turn":1}\n')
+    repo.sessionTrace('s-1', join(dir, 'trace.jsonl'))
+    const result = repo.publish('bot', { operationId: 'doomed' })
+    expect(result.status).toBe('published')
+  })
+
+  test('a torn final timeline line is truncated, earlier corruption throws', async () => {
+    const { repo, dir } = await initRepo('regress-torn-timeline', { 'a.txt': 'v1\n' })
+    const timelinePath = join(dir, '.javelin', 'timeline.jsonl')
+    const before = readFileSync(timelinePath, 'utf8')
+    appendFileSync(timelinePath, '{"seq":99,"type":"layer.cr')
+    expect(() => repo.timeline.read()).not.toThrow()
+    appendFileSync(timelinePath, '\n')
+    const events = repo.timeline.read()
+    expect(events[events.length - 1]!.seq).toBe(1)
+    void before
+    writeFileSync(timelinePath, '{"broken\nnot-the-last-line\n')
+    expect(() => repo.timeline.read()).toThrow()
+  })
+
+  test('crashed ref temp files never appear as layers', async () => {
+    const { repo, dir } = await initRepo('regress-tmp-layer', { 'a.txt': 'v1\n' })
+    await repo.layerCreate('real')
+    writeFileSync(join(dir, '.javelin', 'refs', 'layers', 'ghost.tmp-123-456'), 'junk')
+    expect(repo.layerNames()).toEqual(['real'])
   })
 })
 

@@ -25,15 +25,13 @@ interface Args {
   flags: Map<string, string | boolean>
 }
 
+const BOOLEAN_FLAGS = new Set(['json', 'world', 'full', 'allow-missing-context'])
+
 function parseArgs(argv: string[]): Args {
   const positionals: string[] = []
   const flags = new Map<string, string | boolean>()
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!
-    if (arg === '--json') {
-      flags.set('json', true)
-      continue
-    }
     if (arg.startsWith('--')) {
       const body = arg.slice(2)
       const eq = body.indexOf('=')
@@ -42,7 +40,7 @@ function parseArgs(argv: string[]): Args {
         continue
       }
       const next = argv[i + 1]
-      if (next !== undefined && !next.startsWith('--')) {
+      if (!BOOLEAN_FLAGS.has(body) && next !== undefined && !next.startsWith('--')) {
         flags.set(body, next)
         i++
       } else {
@@ -309,20 +307,17 @@ async function publishCommand(args: Args, rest: string[], io: Io, needRepo: Need
       ...(operationId ? { operationId } : {}),
     })
 
-  try {
-    const result = doPublish(bool(args, 'allow-missing-context'))
-    if (result.status === 'conflict') return emit(false, conflictError(result, 'publish'))
-    return emit(true, result)
-  } catch (e) {
-    if (e instanceof RepositoryError && e.code === 'missing-context' && process.stdin.isTTY) {
-      const answer = await io.promptYesNo('Agent context is unavailable for this layer. Publish without context? [y/N] ')
-      if (!answer) return fail('missing-context', 'publish cancelled by user', true, e.details)
-      const result = doPublish(true)
-      if (result.status === 'conflict') return emit(false, conflictError(result, 'publish'))
-      return emit(true, result)
-    }
-    throw e
+  // Ask before starting the operation so an answered prompt is not a second
+  // publish attempt racing the first operation's record.
+  let allowMissing = bool(args, 'allow-missing-context')
+  if (!allowMissing && process.stdin.isTTY && repo.requiresContextDecision(name)) {
+    const answer = await io.promptYesNo('Agent context is unavailable for this layer. Publish without context? [y/N] ')
+    if (!answer) return fail('missing-context', 'publish cancelled by user', true)
+    allowMissing = true
   }
+  const result = doPublish(allowMissing)
+  if (result.status === 'conflict') return emit(false, conflictError(result, 'publish'))
+  return emit(true, result)
 }
 
 async function sessionCommands(args: Args, sub: string | undefined, needRepo: NeedRepo, emit: Emit, fail: Fail): Promise<number> {

@@ -42,7 +42,9 @@ export class Timeline {
   }
 
   append(type: EventType, refs: Record<string, string>): TimelineEvent {
-    const seq = this.count() + 1
+    const existing = this.read()
+    const last = existing[existing.length - 1]
+    const seq = (last?.seq ?? 0) + 1
     const body = { v: 1, seq, type, at: new Date().toISOString(), refs }
     const id = typedHash('timeline-event', cborEncode(body as unknown as CborValue))
     const event: TimelineEvent = { seq, id: id.ref, type: body.type as EventType, at: body.at, refs }
@@ -50,12 +52,23 @@ export class Timeline {
     return event
   }
 
+  // A torn final line (crash mid-append) is truncated; corruption anywhere
+  // earlier still throws.
   read(limit?: number): TimelineEvent[] {
     if (!existsSync(this.path)) return []
-    const all = readFileSync(this.path, 'utf8')
-      .split('\n')
-      .filter((line) => line.trim() !== '')
-      .map((line) => JSON.parse(line) as TimelineEvent)
+    const lines = readFileSync(this.path, 'utf8').split('\n')
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+    const all: TimelineEvent[] = []
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!.trim()
+      if (line === '') continue
+      try {
+        all.push(JSON.parse(line) as TimelineEvent)
+      } catch (e) {
+        if (i === lines.length - 1) break
+        throw e
+      }
+    }
     return limit === undefined ? all : all.slice(-limit)
   }
 

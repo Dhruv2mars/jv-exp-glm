@@ -194,6 +194,19 @@ describe('cli end to end', () => {
     expect(readFileSync(join(wsA, 'a.txt'), 'utf8')).toBe('v2\n')
   })
 
+  test('diff --world takes two positional versions', () => {
+    const dir = workspace('diff-world')
+    writeFileSync(join(dir, 'a.txt'), 'v1\n')
+    javelin(dir, ['init'])
+    javelin(dir, ['layer', 'create', 'w'])
+    const ws = JSON.parse(javelin(dir, ['layer', 'open', 'w', '--json']).stdout).data.path
+    writeFileSync(join(ws, 'a.txt'), 'v2\n')
+    javelin(dir, ['publish', 'w'])
+    const r = javelin(dir, ['diff', '--world', '1', '2', '--json'])
+    expect(r.code).toBe(0)
+    expect(r.json().data.changes).toEqual([{ path: 'a.txt', before: 'file', after: 'file' }])
+  })
+
   test('errors carry stable codes; usage exits 1 with usage code', () => {
     const dir = workspace('errors')
     const r = javelin(dir, ['history', '--json'])

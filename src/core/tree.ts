@@ -1,7 +1,7 @@
 import { cborEncode, cborDecode, type CborValue } from './cbor.ts'
 import { typedHash, Oid } from './oids.ts'
 import { ObjectStore } from './objects.ts'
-import { validatePath } from './paths.ts'
+import { validatePath, assertNoCollisions } from './paths.ts'
 
 // Trees are the fundamental state. A tree is an immutable, content-addressed
 // directory record whose entries are sorted by UTF-8 bytes of the name, so
@@ -126,6 +126,7 @@ export class Trees {
   // is shared with the base.
   applyChanges(base: Oid | null, changes: Map<string, Change>): Oid {
     for (const path of changes.keys()) validatePath(path)
+    assertNoCollisions(changes.keys())
     return this.applyInto(base ?? this.emptyTree(), changes)
   }
 
@@ -159,10 +160,15 @@ export class Trees {
       const sub = nested.get(d.name)
       if (sub) {
         const localLeaf = local.find(([n]) => n === d.name)
+        const emptied = this.applyInto(d.oid, sub)
         if (localLeaf && localLeaf[1] !== null) {
-          throw new PathKindConflict(d.name)
+          // A leaf replaces the directory. This composes only when the
+          // nested change set empties the directory completely.
+          if (!emptied.equals(this.emptyTree())) throw new PathKindConflict(d.name)
+          nested.delete(d.name)
+          continue
         }
-        nextDirs.push({ name: d.name, oid: this.applyInto(d.oid, sub) })
+        nextDirs.push({ name: d.name, oid: emptied })
         nested.delete(d.name)
       } else if (local.some(([n, c]) => n === d.name && c === null)) {
         // deleting a whole subtree

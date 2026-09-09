@@ -32,6 +32,9 @@ interface LockBody {
 }
 
 const STALE_MS = 30_000
+// A lock whose body is unreadable was most likely torn by a crash between
+// create and body write; two seconds is enough to rule out that window.
+const UNREADABLE_GRACE_MS = 2_000
 
 function pidAlive(pid: number): boolean {
   try {
@@ -70,7 +73,9 @@ export class Refs {
   // crash can never strand the repository.
   private withLock<T>(name: string, fn: () => T): T {
     const path = this.lockPath(name)
-    const deadline = Date.now() + 10_000
+    // The deadline must exceed STALE_MS so a stalled live holder is
+    // reachable by the staleness steal.
+    const deadline = Date.now() + STALE_MS + 5_000
     for (;;) {
       try {
         const fd = openSync(path, 'wx')
@@ -87,7 +92,7 @@ export class Refs {
         // An unreadable lock (crash between create and body write) is only
         // stolen once it is old; a live writer may still be initialising it.
         try {
-          steal = Date.now() - statSync(path).mtimeMs > STALE_MS
+          steal = Date.now() - statSync(path).mtimeMs > UNREADABLE_GRACE_MS
         } catch {
           steal = false
         }

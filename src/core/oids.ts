@@ -13,8 +13,10 @@ const CODE_ALGO: Record<number, Algo> = { 0x01: 'blake3', 0x02: 'sha256' }
 const ALGO_LEN: Record<Algo, number> = { blake3: 32, sha256: 32 }
 
 // Every hash input is domain-separated and versioned:
-//   "JVL\0" ++ varint(FORMAT_MAJOR) ++ tag ++ varint(payload length) ++ payload
-// so the same bytes under different domains never collide.
+//   "JVL\0" ++ varint(FORMAT_MAJOR) ++ varint(tag length) ++ tag ++
+//   varint(payload length) ++ payload
+// Length-prefixing both the tag and the payload makes the preimage
+// self-delimiting, so no two (domain, payload) pairs can encode alike.
 const FORMAT_MAJOR = 1
 const PREIMAGE_PREFIX = new Uint8Array([0x4a, 0x56, 0x4c, 0x00]) // "JVL\0"
 
@@ -143,12 +145,17 @@ export async function oidReady(): Promise<void> {
 export function typedHash(domain: string, payload: Uint8Array, algo: Algo = 'blake3'): Oid {
   const tag = new TextEncoder().encode(domain)
   const len =
-    PREIMAGE_PREFIX.length + varintLen(FORMAT_MAJOR) + tag.length + varintLen(payload.length)
+    PREIMAGE_PREFIX.length +
+    varintLen(FORMAT_MAJOR) +
+    varintLen(tag.length) +
+    tag.length +
+    varintLen(payload.length)
   const preimage = new Uint8Array(len + payload.length)
   let off = 0
   preimage.set(PREIMAGE_PREFIX, off)
   off += PREIMAGE_PREFIX.length
   off = writeVarint(preimage, off, FORMAT_MAJOR)
+  off = writeVarint(preimage, off, tag.length)
   preimage.set(tag, off)
   off += tag.length
   off = writeVarint(preimage, off, payload.length)

@@ -1,4 +1,16 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, statSync, rmSync, writeFileSync, symlinkSync, chmodSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, statSync, lstatSync, rmSync, writeFileSync, symlinkSync, chmodSync, renameSync } from 'node:fs'
+
+// existsSync follows symlinks and reports a broken link as absent, which
+// makes seal oscillate between storing and deleting it. lstat looks at the
+// link itself.
+function pathPresent(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch {
+    return false
+  }
+}
 import { join, dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { cborEncode, type CborValue } from './cbor.ts'
@@ -90,6 +102,16 @@ export class RepositoryError extends Error {
 }
 
 const LATEST_SCAN_LIMIT = 16
+const OP_STALE_MS = 30_000
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
 
 export class Repo {
   readonly metaDir: string
@@ -193,7 +215,7 @@ export class Repo {
   layerNames(): string[] {
     const dir = join(this.metaDir, 'refs', 'layers')
     if (!existsSync(dir)) return []
-    return readdirSync(dir).sort()
+    return readdirSync(dir).filter((name) => !name.includes('.tmp-')).sort()
   }
 
   layer(name: string): LayerRecord {
@@ -202,15 +224,15 @@ export class Repo {
     return entry.data
   }
 
-  private writeLayer(name: string, record: LayerRecord, expectedGen: number): void {
-    this.refs.casWrite(`layers/${name}`, expectedGen, record)
-  }
-
   private updateLayer(name: string, mutate: (record: LayerRecord) => LayerRecord): LayerRecord {
-    const entry = this.refs.update<LayerRecord>(`layers/${name}`, (d) => {
-      if (!d) throw new RepositoryError('not-found', `layer ${name} does not exist`)
-      return mutate(d)
-    })
+    const entry = this.refs.update<LayerRecord>(
+      `layers/${name}`,
+      (d) => {
+        if (!d) throw new RepositoryError('not-found', `layer ${name} does not exist`)
+        return mutate(d)
+      },
+      { fsyncDir: true },
+    )
     return entry.data
   }
 
@@ -318,7 +340,7 @@ export class Repo {
     }
     // Paths tracked but absent from the workspace were deleted.
     for (const path of tracked.keys()) {
-      const present = existsSync(join(workspace, path))
+      const present = pathPresent(join(workspace, path))
       const scanned = changes.get(path)
       if (!present && !scanned) changes.set(path, null)
     }
@@ -348,7 +370,7 @@ export class Repo {
     if (existsSync(workspace)) {
       this.scanInto(workspace, '', tracked, IgnoreRules.load(this.projectDir), changes)
     }
-    const missing = [...tracked.keys()].filter((p) => !existsSync(join(workspace, p)))
+    const missing = [...tracked.keys()].filter((p) => !pathPresent(join(workspace, p)))
     return {
       record,
       unsealed: [...changes.keys()].sort(),
@@ -365,9 +387,22 @@ export class Repo {
   ): PublishResult | ConflictResult {
     const op = this.opsBegin(opts?.operationId)
     if (op.replayed) return op.result as PublishResult | ConflictResult
-    const result = this.publishInner(name, opts)
-    this.opsFinish(op.id, result)
-    return result
+    try {
+      const result = this.publishInner(name, opts)
+      this.opsFinish(op.id, result)
+      return result
+    } catch (e) {
+      this.recoverOrAbort(op.id, name)
+      throw e
+    }
+  }
+
+  // Whether publishing this layer would hit the missing-context gate, so a
+  // caller can ask the user before starting the operation at all.
+  requiresContextDecision(name: string): boolean {
+    const record = this.layer(name)
+    if (record.status === 'published' || !record.agent) return false
+    return record.chunks.length === 0 && record.subtasks.every((s) => s.chunks.length === 0)
   }
 
   private publishInner(
@@ -493,9 +528,16 @@ export class Repo {
   stack(sources: string[], into: string, opts?: { operationId?: string }): StackResult | ConflictResult {
     const op = this.opsBegin(opts?.operationId)
     if (op.replayed) return op.result as StackResult | ConflictResult
-    const result = this.stackInner(sources, into)
-    this.opsFinish(op.id, result)
-    return result
+    try {
+      const result = this.stackInner(sources, into)
+      this.opsFinish(op.id, result)
+      return result
+    } catch (e) {
+      // Stack mutates only after every source composes cleanly, so an
+      // exception means nothing was written: release the operation.
+      this.opsAbort(op.id)
+      throw e
+    }
   }
 
   private stackInner(sources: string[], into: string): StackResult | ConflictResult {
@@ -746,10 +788,19 @@ export class Repo {
     ignore: IgnoreRules,
     changes: Map<string, Change>,
   ): void {
+    const trackedDirs = new Set<string>()
+    for (const path of tracked.keys()) {
+      let seg = path.indexOf('/')
+      while (seg !== -1) {
+        trackedDirs.add(path.slice(0, seg))
+        seg = path.indexOf('/', seg + 1)
+      }
+    }
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = prefix + entry.name
       if (entry.name === '.javelin') continue
       if (entry.isDirectory()) {
+        if (!trackedDirs.has(path) && ignore.matched(path, true)) continue
         this.scanInto(join(dir, entry.name), `${path}/`, tracked, ignore, changes)
         continue
       }
@@ -775,11 +826,12 @@ export class Repo {
 
   private materializeWorkspace(name: string, treeId: Oid): void {
     const dest = this.workspacePath(name)
-    rmSync(dest, { recursive: true, force: true })
-    mkdirSync(dest, { recursive: true })
+    const staging = `${dest}.staging-${process.pid}-${Date.now()}`
+    rmSync(staging, { recursive: true, force: true })
+    mkdirSync(staging, { recursive: true })
     for (const [path, entry] of this.trees.listFiles(treeId)) {
       validatePath(path)
-      const target = join(dest, path)
+      const target = join(staging, path)
       mkdirSync(dirname(target), { recursive: true })
       if (entry.kind === 'symlink') {
         symlinkSync(this.trees.readSymlink(entry.oid), target)
@@ -788,27 +840,80 @@ export class Repo {
       writeFileSync(target, this.trees.readBlob(entry.oid))
       if (entry.kind === 'exec') chmodSync(target, 0o755)
     }
+    rmSync(dest, { recursive: true, force: true })
+    renameSync(staging, dest)
   }
 
   // ---- idempotent operations ----
 
+  private opsPath(operationId: string): string {
+    return join(this.metaDir, 'ops', `${operationId}.json`)
+  }
+
+  // An operation file records the holder's pid. A file left running by a
+  // dead process is adopted; a live holder blocks the id until it finishes.
   private opsBegin(operationId?: string): { id: string | null; replayed: boolean; result?: unknown } {
     if (!operationId) return { id: null, replayed: false }
-    const path = join(this.metaDir, 'ops', `${operationId}.json`)
+    const path = this.opsPath(operationId)
     if (existsSync(path)) {
-      const body = JSON.parse(readFileSync(path, 'utf8')) as { status: string; result?: unknown }
+      let body: { status?: string; result?: unknown; pid?: number; at?: string }
+      try {
+        body = JSON.parse(readFileSync(path, 'utf8')) as typeof body
+      } catch {
+        body = {}
+      }
       if (body.status === 'done') return { id: operationId, replayed: true, result: body.result }
-      throw new RepositoryError('operation-in-progress', `operation ${operationId} is already running`)
+      const startedAt = body.at ? Date.parse(body.at) : 0
+      const stale = Date.now() - startedAt > OP_STALE_MS
+      const alive = body.pid !== undefined && pidAlive(body.pid)
+      if (alive && !stale && body.status === 'running') {
+        throw new RepositoryError('operation-in-progress', `operation ${operationId} is already running`)
+      }
     }
     mkdirSync(join(this.metaDir, 'ops'), { recursive: true })
-    writeFileSync(path, JSON.stringify({ status: 'running', at: new Date().toISOString() }))
+    this.writeOpsFile(operationId, { status: 'running', pid: process.pid, at: new Date().toISOString() })
     return { id: operationId, replayed: false }
+  }
+
+  private writeOpsFile(operationId: string, body: Record<string, unknown>): void {
+    const path = this.opsPath(operationId)
+    mkdirSync(dirname(path), { recursive: true })
+    const tmp = `${path}.tmp-${process.pid}-${Date.now()}`
+    writeFileSync(tmp, JSON.stringify(body))
+    renameSync(tmp, path)
+  }
+
+  // Called when the wrapped operation throws: adopt an accepted version if
+  // the mutation landed before the failure, otherwise release the id.
+  private recoverOrAbort(operationId: string | null, layerName: string): void {
+    if (!operationId) return
+    try {
+      const record = this.layer(layerName)
+      const adopted = record.status === 'published' ? null : this.findVersionByLayer(record.id, record.baseSeq)
+      const version = record.publishedAs ?? adopted?.ref ?? null
+      if (version) {
+        this.opsFinish(operationId, {
+          status: 'published',
+          seq: this.worldRecord(version).seq,
+          version,
+          changedPaths: [],
+        })
+        return
+      }
+    } catch {
+      // fall through and release the id
+    }
+    this.opsAbort(operationId)
+  }
+
+  private opsAbort(operationId: string | null): void {
+    if (!operationId) return
+    rmSync(this.opsPath(operationId), { force: true })
   }
 
   private opsFinish(operationId: string | null, result: unknown): void {
     if (!operationId) return
-    const path = join(this.metaDir, 'ops', `${operationId}.json`)
-    writeFileSync(path, JSON.stringify({ status: 'done', result }, null, 2))
+    this.writeOpsFile(operationId, { status: 'done', result })
   }
 }
 
@@ -817,10 +922,6 @@ function validateLayerName(name: string): void {
     throw new RepositoryError('usage', `invalid layer name ${JSON.stringify(name)}`)
   }
   assertNoCollisions([name])
-}
-
-export function shortId(ref: string): string {
-  return ref.slice(-12)
 }
 
 export { typedHash, Oid }

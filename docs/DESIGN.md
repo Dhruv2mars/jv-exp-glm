@@ -18,7 +18,7 @@ Every task starts in a Layer. A Layer is an isolated workspace for one unit of w
 
 A Layer stores only its changes: a base World version plus an overlay of created, modified, and deleted paths. Creating a Layer writes small metadata and materializes a workspace folder; it never copies the repository. The workspace folder is the working state, and it is what editors, compilers, and agents see. Sealing scans the workspace, writes the changed content as immutable objects, and advances the Layer's saved root through an atomic pointer swap. Seal runs at agent lifecycle boundaries and automatically before clone, stack, and publish.
 
-Cloning a Layer copies one state-root pointer and materializes a fresh workspace. The clone shares all objects with its source, costs nothing proportional to the World, and never sees later edits to the source.
+Cloning a Layer copies one state-root pointer and materializes a fresh workspace. The clone shares all objects with its source, costs nothing proportional to the World, and never sees later edits to the source. The clone inherits the source's captured context, because the state it starts from was produced under that trace; work the clone does afterwards extends that record.
 
 Nested Layers exist at the parent agent's discretion: a parent that wants a subagent to have independent code isolation creates a child Layer and stacks it back when the subagent finishes. Subagents that share the parent's Layer are one agent system; Javelin records their traces under the parent's context and does not coordinate their writes.
 
