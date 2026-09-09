@@ -19,7 +19,7 @@ Status after the semantics realignment (2026-09-09). Normative model: `docs/jave
 | Slice | Scope | Status |
 |---|---|---|
 | contracts | javelin-model.md, ADRs 0004-0009, protocol model.ts | merged |
-| community | MIT LICENSE, CONTRIBUTING, CoC, SECURITY, templates, changelog | in progress |
+| community | MIT LICENSE, CONTRIBUTING, CoC, SECURITY, templates, changelog | merged |
 | vcs-core-v2 | states/trees/mode, layers/checkpoints, world head, contributions, diff3 merge + deletions, MetaStore CAS, GC reachability | in progress |
 | jrp-v2 | wire format, bounds, raw blob endpoints, pagination, spec doc | in progress |
 | javelind-v2 | head CAS via MetaStore seam, bounded/streaming endpoints, health/readiness, request IDs, structured logs | pending |
