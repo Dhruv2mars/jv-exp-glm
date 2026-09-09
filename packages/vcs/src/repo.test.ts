@@ -536,6 +536,32 @@ describe("Repository v2", () => {
     expect(stored.meta.events.filter((event) => event.status === "published")).toHaveLength(1);
   });
 
+  test("refresh reports a binary conflict instead of merging non-UTF-8 content", async () => {
+    const repo = await init(root);
+    const binary = Buffer.from([0x61, 0x0a, 0x00, 0x80, 0xff, 0x0a, 0x62, 0x0a]);
+    const ours = Buffer.from([0x41, 0x0a, 0x00, 0x80, 0xff, 0x0a, 0x62, 0x0a]);
+    const theirs = Buffer.from([0x61, 0x0a, 0x00, 0x80, 0xff, 0x0a, 0x42, 0x0a]);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "data.bin"), binary);
+    });
+    await forkAndCheckpoint(repo, "bin", "ours edit", async () => {
+      await writeFile(join(root, "data.bin"), ours);
+    });
+    await publishEdit(repo, "worldside", "theirs edit", async () => {
+      await writeFile(join(root, "data.bin"), theirs);
+    });
+
+    const result = await repo.refresh("bin");
+    expect(result.ok).toBe(false);
+    expect(result.conflicts).toHaveLength(1);
+    expect(result.conflicts[0]!.path).toBe("data.bin");
+    expect(result.conflicts[0]!.kind).toBe("binary");
+
+    const head = (await repo.layerGet("bin"))!.head!;
+    const clone = await freshClone(repo, head);
+    expect(await readFile(join(clone, "data.bin"))).toEqual(ours);
+  });
+
   test("provenance and evidence are append-only references", async () => {
     const repo = await init(root);
     await publishEdit(repo, "seed", "seed", async () => {
