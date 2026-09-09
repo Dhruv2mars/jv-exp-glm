@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, utimes, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ObjectId } from "../../protocol/src/model";
-import { init, openRepository, Repository, type Author, type PublishResult } from "./repo";
+import { init, openRepository, Repository, type Author, type FileMap, type MergeConflict, type PublishResult } from "./repo";
 
 const AUTHOR: Author = { name: "agent", email: "agent@javelin.dev" };
 
@@ -358,6 +358,53 @@ describe("Repository v2", () => {
     expect(result.reason).toBe("world-moved");
     expect(await repo.worldHead()).not.toBe(worldBefore);
     expect((await repo.contribution(contribId))!.meta.status).toBe("open");
+  });
+
+  test("refresh fails loudly when a checkpoint lands mid-merge, keeping the checkpoint", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "file.txt"), "one\ntwo\nthree\n");
+    });
+    const cp = await forkAndCheckpoint(repo, "work", "layer edit", async () => {
+      await writeFile(join(root, "file.txt"), "ONE\ntwo\nthree\n");
+    });
+    await publishEdit(repo, "worldside", "world edit", async () => {
+      await writeFile(join(root, "file.txt"), "one\ntwo\nTHREE\n");
+    });
+    await repo.layerSwitch("work");
+
+    class RacyRepo extends Repository {
+      injected = false;
+      constructor() {
+        super(root, join(root, ".javelin"));
+      }
+      protected override async mergeTrees(
+        baseState: ObjectId | null,
+        oursState: ObjectId,
+        theirsState: ObjectId,
+      ): Promise<{ files: FileMap | null; conflicts: MergeConflict[] }> {
+        if (!this.injected) {
+          this.injected = true;
+          const racer = await openRepository(root);
+          await racer.checkpoint({ message: "mid-merge checkpoint", author: AUTHOR, layer: "work" });
+        }
+        return super.mergeTrees(baseState, oursState, theirsState);
+      }
+    }
+    const racy = new RacyRepo();
+    const result = await racy.refresh("work");
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("layer-moved");
+
+    const head = (await repo.layerGet("work"))!.head;
+    expect(head).not.toBe(cp);
+    const headState = await repo.loadState(head!);
+    expect(headState.message).toBe("mid-merge checkpoint");
+    expect(headState.parents).toEqual([cp]);
+
+    const fsck = await repo.fsck();
+    expect(fsck.ok).toBe(true);
+    expect(fsck.unreachable).not.toContain(head!);
   });
 
   test("provenance and evidence are append-only references", async () => {
