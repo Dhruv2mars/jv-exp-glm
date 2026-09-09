@@ -5,13 +5,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const fsyncCalls: number[] = [];
+const realFsync = fsReal.fsync;
 
 mock.module("node:fs/promises", () => {
   const mocked = {
     ...fsReal,
-    fsync: async (handle: { fd: number }) => {
-      fsyncCalls.push(handle.fd);
-      return fsReal.fsync(handle as never);
+    fsync: async (target: number | { fd: number }) => {
+      const fd = typeof target === "number" ? target : target.fd;
+      fsyncCalls.push(fd);
+      return realFsync(fd as never);
     },
   };
   return { ...mocked, default: mocked };
