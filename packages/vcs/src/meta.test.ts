@@ -1,11 +1,23 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MetaStore } from "./meta";
 
 let dir: string;
 let metaDir: string;
+const lockPath = () => join(metaDir, "k.lock");
+
+function locker(store: MetaStore): { withLock: (key: string, fn: () => Promise<string>) => Promise<string> } {
+  return store as unknown as { withLock: (key: string, fn: () => Promise<string>) => Promise<string> };
+}
+
+async function until(check: () => Promise<boolean>): Promise<void> {
+  for (;;) {
+    if (await check()) return;
+    await Bun.sleep(5);
+  }
+}
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "jvl-meta-"));
@@ -90,8 +102,7 @@ describe("MetaStore", () => {
     expect(await store.get("k")).toBeNull();
   });
 
-  test("two real bun processes race one CAS key; exactly one winner per round", async () => {
-    const store = new MetaStore(metaDir);
+  test("two real bun processes race one CAS key; exactly one winner per round", async () => {    const store = new MetaStore(metaDir);
     const workerPath = join(dir, "cas-worker.ts");
     const src = `
 import { MetaStore } from ${JSON.stringify(join(import.meta.dir, "meta.ts"))};
@@ -121,4 +132,77 @@ console.log(wins);
     expect(wins[0]! + wins[1]!).toBe(20);
     expect(await store.get("race")).toMatch(/^20:\d+$/);
   }, 30_000);
+
+  test("two racers CASing from the same expected: exactly one ok", async () => {
+    const s1 = new MetaStore(metaDir);
+    const s2 = new MetaStore(metaDir);
+    const [r1, r2] = await Promise.all([
+      s1.compareAndSwap("race", null, "one"),
+      s2.compareAndSwap("race", null, "two"),
+    ]);
+    expect([r1.ok, r2.ok].filter(Boolean)).toHaveLength(1);
+    const winner = r1.ok ? r1 : r2;
+    expect(await s1.get("race")).toBe(winner.current);
+  });
+
+  test("the original holder's late release does not delete the new holder's lock", async () => {
+    const storeA = new MetaStore(metaDir);
+    const storeB = new MetaStore(metaDir);
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const holdA = locker(storeA).withLock("k", async () => {
+      await gateA;
+      return "A";
+    });
+    await until(() => readFile(lockPath(), "utf8").then(() => true).catch(() => false));
+    const backdated = new Date(Date.now() - 11_000);
+    await utimes(lockPath(), backdated, backdated);
+
+    let releaseB!: () => void;
+    const gateB = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    const holdB = locker(storeB).withLock("k", async () => {
+      await gateB;
+      return "B";
+    });
+    await until(async () => {
+      const stats = await stat(lockPath()).catch(() => null);
+      return stats !== null && Date.now() - stats.mtimeMs < 2_000;
+    });
+
+    releaseA();
+    expect(await holdA).toBe("A");
+    const held = await readFile(lockPath(), "utf8");
+    expect(held).not.toContain(String(process.pid));
+
+    releaseB();
+    expect(await holdB).toBe("B");
+    await until(() => readFile(lockPath(), "utf8").then(() => false).catch(() => true));
+  });
+
+  test("a live slow holder is never stolen from; bodies never overlap", async () => {
+    let inside = 0;
+    let maxInside = 0;
+    const track = (fn: () => Promise<string>): Promise<string> => {
+      inside++;
+      maxInside = Math.max(maxInside, inside);
+      return fn().finally(() => {
+        inside--;
+      });
+    };
+    const storeA = new MetaStore(metaDir, { staleLockMs: 120 });
+    const storeB = new MetaStore(metaDir, { staleLockMs: 120, lockTimeoutMs: 5_000 });
+    const holdA = locker(storeA).withLock("k", () =>
+      track(async () => {
+        await Bun.sleep(400);
+        return "A";
+      }),
+    );
+    const holdB = locker(storeB).withLock("k", () => track(async () => "B"));
+    expect(await Promise.all([holdA, holdB])).toEqual(["A", "B"]);
+    expect(maxInside).toBe(1);
+  }, 15_000);
 });
