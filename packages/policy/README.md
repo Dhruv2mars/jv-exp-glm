@@ -1,17 +1,41 @@
 # @javelin/policy
 
-Evidence and acceptance policy for Javelin repositories.
+Publish-boundary policy for Javelin repositories.
 
-A repository may declare a policy in its javelind `meta.json` (same file that holds `name`, `createdAt`, `defaultBranch`):
+Publish is not CI. `Repository.publish` enforces VCS correctness only: fast-forward integrity, compare-and-swap, object completeness. Required checks are an optional, per-repository policy that callers evaluate at the publish boundary. With no policy, publish succeeds on VCS correctness alone.
+
+## Policy shape
+
+The policy is JSON stored in repo meta under the key `policy`:
 
 ```json
-{ "policy": { "requireEvidence": ["ci-green", "lint-clean"] } }
+{
+  "requireEvidence": [
+    { "check": "build" },
+    { "check": "lint", "rules": "lint-rules@1" }
+  ],
+  "requiredContribution": true
+}
 ```
 
-Pushes succeed without a policy unless the repo declares one. A declared policy lists evidence check names that must each have a passing `EvidenceRecord` reachable from the pushed head commit's history.
+- `requireEvidence` lists checks that each need a passing `EvidenceRecord` on the proposed state. When an entry pins `rules`, only evidence produced under that exact ruleset counts.
+- `requiredContribution` requires the publish to go through an open contribution whose proposed state is still the layer head.
+- Absent policy or `{}` means no requirements.
 
-## API
+`setPolicy` validates the shape and writes through a MetaStore compare-and-swap; `setPolicy(repo, null)` removes the policy. `getPolicy` returns `null` when absent and throws `PolicyError` when the stored value is malformed.
 
-- `evaluatePolicy(repo, newHead, policy)` walks commits from `newHead` (BFS over parents), reads every object referenced by each commit's `provenance` id list, and collects `EvidenceRecord`s. Each required check needs a `pass` record; a reachable `fail` record for a required check is itself a violation. Returns `{ ok, violations: [{ check, detail }] }`.
-- `attachEvidence(repo, commitId, record)` writes the record into the object store and appends its id to the commit's `provenance` list by amending the commit (same tree/parents/message) and CAS fast-forwarding the ref that points at it. This mirrors the mechanism in `@javelin/provenance` and is reimplemented here so this package does not depend on it.
-- `setPolicy(repoRoot, policy)` / `getPolicy(repoRoot)` read and write the `policy` field of `<repoRoot>/.javelin/meta.json`, preserving other fields and writing atomically. `setPolicy(root, null)` removes the policy.
+## Publish flow
+
+1. Build the change in a layer and checkpoint it.
+2. Open a contribution with `Repository.contribute`.
+3. Run the checks your policy names and record each result with `recordCheck`.
+4. Call `evaluatePublish(repo, contributionId)`. It returns `{ ok, violations: [{ check, detail }] }`.
+5. When `ok` is true, call `Repository.publish`.
+
+`evaluatePublish` reads only evidence records that reference the contribution's proposed state, through `Repository.evidenceFor`. It never walks state history. The `requiredContribution` check verifies the contribution is open and that its proposed state still equals the layer head.
+
+## Evidence binding and reuse
+
+An `EvidenceRecord` binds `state`, `rules`, `environment`, and per-check results (docs/adr/0005). `recordCheck(repo, { state, rules, environment, checks })` writes one through `Repository.recordEvidence`.
+
+Evidence is reusable when the state, the rules, and the environment are all unchanged. New state content, a new ruleset revision, or a new environment invalidates reuse: record fresh evidence for the new binding. Evidence on a different state never satisfies a check.
