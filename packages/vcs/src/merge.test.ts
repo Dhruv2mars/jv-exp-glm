@@ -49,6 +49,10 @@ describe("diff3", () => {
     expect(merge("a\nb\nc\nd\n", "A\nb\nc\nd\n", "a\nb\nc\nD\n")).toBe("A\nb\nc\nD\n");
   });
 
+  test("adjacent-line edits on a 2-line file merge", () => {
+    expect(merge("a\nb\n", "A\nb\n", "a\nB\n")).toBe("A\nB\n");
+  });
+
   test("empty base with content on one side", () => {
     expect(merge("", "ours\n", "")).toBe("ours\n");
     expect(merge("", "", "theirs\n")).toBe("theirs\n");
