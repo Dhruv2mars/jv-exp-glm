@@ -1,5 +1,7 @@
-import type { ObjectId, ProvenanceRecord } from "@javelin/protocol";
-import { recordProvenance } from "@javelin/provenance";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import type { ObjectId, ProvenanceRecord } from "../../protocol/src/model";
+import { recordRun } from "@javelin/provenance";
 import type { Repository } from "@javelin/vcs";
 
 /** A file change an agent produced, keyed by repo-relative path. */
@@ -16,13 +18,13 @@ export interface AgentRunSpec {
   finishedAt?: string;
   exit?: ProvenanceRecord["exit"];
   summary?: string;
-  /** Commit message; defaults to a structured agent message. */
+  /** Checkpoint message; defaults to a structured agent message. */
   message?: string;
   author?: { name: string; email: string };
 }
 
 export interface CapturedRun {
-  commitId: ObjectId;
+  stateId: ObjectId;
   provenanceId: ObjectId;
   record: ProvenanceRecord;
 }
@@ -43,9 +45,8 @@ export function structuredMessage(spec: AgentRunSpec): string {
   return lines.join("\n");
 }
 
-export function toRecord(spec: AgentRunSpec): ProvenanceRecord {
+export function toRecord(spec: AgentRunSpec): Omit<ProvenanceRecord, "kind" | "states"> {
   return {
-    kind: "provenance",
     agent: {
       name: spec.agent,
       adapter: spec.adapter ?? "generic",
@@ -61,45 +62,36 @@ export function toRecord(spec: AgentRunSpec): ProvenanceRecord {
   };
 }
 
+async function applyFileChanges(repo: Repository, files: FileChanges): Promise<void> {
+  const root = resolve(repo.root);
+  for (const [path, data] of Object.entries(files)) {
+    const target = resolve(root, path);
+    if (target !== root && !target.startsWith(root + "/")) {
+      throw new Error(`file path escapes the repository working dir: ${path}`);
+    }
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, typeof data === "string" ? new TextEncoder().encode(data) : data);
+  }
+}
+
 /**
- * Captures an agent run: stages `files` onto the working tree/index, commits
- * with a structured message, then records provenance (which amends the commit
- * and fast-forwards the branch). Returns the amended commit id and the
- * provenance record id.
+ * Captures an agent run on the checked-out layer: applies `files` to the
+ * working dir, checkpoints the layer, then records a provenance object
+ * referencing the checkpoint state (docs/adr/0005). States are never mutated.
  */
 export async function captureAgentRun(
   repo: Repository,
   spec: AgentRunSpec,
   files: FileChanges = {},
 ): Promise<CapturedRun> {
-  for (const [path, data] of Object.entries(files)) {
-    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-    await repo.stage(path, bytes);
-  }
-  const commitId = await repo.commit({
+  await applyFileChanges(repo, files);
+  const { stateId } = await repo.checkpoint({
     message: spec.message ?? structuredMessage(spec),
-    ...(spec.author ? { author: spec.author, committer: spec.author } : {}),
+    ...(spec.author ? { author: spec.author } : {}),
   });
-  const record = toRecord(spec);
-  const { provenanceId, commitId: amendedId } = await recordProvenance(repo, commitId, record);
-  return { commitId: amendedId, provenanceId, record };
-}
-
-export interface CommitWithProvenanceOptions extends AgentRunSpec {
-  adapter: ProvenanceRecord["agent"]["adapter"];
-  /** Extra file changes to include in the commit. */
-  files?: FileChanges;
-}
-
-/**
- * CLI-facing helper: commit `files` (or whatever is already staged) and attach
- * provenance describing the agent session that produced it.
- */
-export async function commitWithProvenance(
-  repo: Repository,
-  opts: CommitWithProvenanceOptions,
-): Promise<CapturedRun> {
-  return captureAgentRun(repo, opts, opts.files ?? {});
+  const record: ProvenanceRecord = { kind: "provenance", ...toRecord(spec), states: [stateId] };
+  const provenanceId = await recordRun(repo, record);
+  return { stateId, provenanceId, record };
 }
 
 /**
@@ -113,8 +105,7 @@ export async function runChain(
   const captured: CapturedRun[] = [];
   for (const { spec, files } of runs) {
     const parentRun = captured.length > 0 ? captured[captured.length - 1]!.provenanceId : spec.parentRun;
-    const run = await captureAgentRun(repo, { ...spec, parentRun }, files ?? {});
-    captured.push(run);
+    captured.push(await captureAgentRun(repo, { ...spec, parentRun }, files ?? {}));
   }
   return captured;
 }
