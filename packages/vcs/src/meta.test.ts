@@ -69,14 +69,28 @@ describe("MetaStore", () => {
     expect(await store.get("layer/one")).toBeNull();
   });
 
-  test("list returns keys under a prefix, skipping lock and temp files", async () => {
+  test("list returns .lock keys and hides the .locks dir and temp files", async () => {
     const store = new MetaStore(metaDir);
     await store.create("layer/alpha", "1");
-    await store.create("layer/beta", "2");
+    await store.create("layer/notes.lock", "2");
     await store.create("world", "3");
-    await writeFile(join(metaDir, "layer", "gamma.lock"), "junk");
-    expect(await store.list("layer/")).toEqual(["layer/alpha", "layer/beta"]);
-    expect(await store.list()).toEqual(["layer/alpha", "layer/beta", "world"]);
+    await writeFile(join(metaDir, ".tmp-junk"), "x");
+    const keys = await store.list();
+    expect(keys).toContain("layer/alpha");
+    expect(keys).toContain("layer/notes.lock");
+    expect(keys).not.toContain(".tmp-junk");
+    expect(keys.every((key) => !key.startsWith(".locks"))).toBe(true);
+  });
+
+  test("a meta key named world.lock does not wedge the world lockfile", async () => {
+    const store = new MetaStore(metaDir, { lockTimeoutMs: 500 });
+    expect(await store.create("world.lock", "v")).toBe(true);
+    expect(await store.create("world", "w")).toBe(true);
+    expect(await store.get("world.lock")).toBe("v");
+    expect(await store.get("world")).toBe("w");
+    expect((await store.list()).sort()).toEqual(["world", "world.lock"]);
+    expect(await store.delete("world.lock")).toBe(true);
+    expect(await store.compareAndSwap("world", "w", "w2")).toEqual({ ok: true, current: "w2" });
   });
 
   test("rejects invalid keys", async () => {

@@ -562,6 +562,36 @@ describe("Repository v2", () => {
     expect(await readFile(join(clone, "data.bin"))).toEqual(ours);
   });
 
+  test("layerNew rejects reserved names", async () => {
+    const repo = await init(root);
+    await expect(repo.layerNew("world")).rejects.toThrow("reserved layer name");
+    await expect(repo.layerNew("current")).rejects.toThrow("reserved layer name");
+    await expect(repo.layerNew("x.lock")).rejects.toThrow("reserved layer name");
+    await expect(repo.layerNew("ok-name")).resolves.toBeDefined();
+  });
+
+  test("a layer named notes.lock is listed and stays gc-reachable", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+    });
+    const cp = await forkAndCheckpoint(repo, "notes.lock", "scratch", async () => {
+      await writeFile(join(root, "scratch.txt"), "scratch\n");
+    });
+    expect((await repo.layerList()).map((ref) => ref.name)).toContain("notes.lock");
+
+    const state = await repo.loadState(cp);
+    const tree = await repo.loadTree(state.tree);
+    const scratchBlob = tree.entries.find((entry) => entry.name === "scratch.txt")!.id;
+    const past = new Date(Date.now() - 2 * 3_600_000);
+    for (const id of [cp, state.tree, scratchBlob]) {
+      await utimes(repo.objects.shardPath(id), past, past);
+    }
+    await repo.gc();
+    expect(await repo.objects.has(cp)).toBe(true);
+    expect((await repo.layerGet("notes.lock"))!.head).toBe(cp);
+  });
+
   test("provenance and evidence are append-only references", async () => {
     const repo = await init(root);
     await publishEdit(repo, "seed", "seed", async () => {
