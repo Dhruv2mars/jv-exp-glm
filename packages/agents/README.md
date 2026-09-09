@@ -1,23 +1,29 @@
 # @javelin/agents
 
-Agent integrations for Javelin. Coding agents commit work through `@javelin/vcs`
-repositories with machine-readable provenance attached, so a human supervisor
-can see who produced every commit, with which model, from which prompt.
+Agent integrations for Javelin. Coding agents checkpoint work onto a Javelin
+layer through `@javelin/vcs` and record append-only provenance objects
+(docs/adr/0005), so a human supervisor can see who produced every state, with
+which model, from which prompt — without ever rewriting a state.
 
-## Generic capture
+## The capture flow
 
 `captureAgentRun(repo, spec, files)` — the core primitive. It:
 
-1. stages `files` (a `Record<path, string | Uint8Array>`) into the index,
-2. commits with a structured message (`agent(<adapter>): <prompt summary>` plus
-   `Javelin-Agent:` / `Javelin-Model:` / `Javelin-Session:` / `Javelin-Parent-Run:` trailers),
-3. records a `ProvenanceRecord` via `@javelin/provenance` (which amends the
-   commit and fast-forwards the branch ref),
-4. returns `{ commitId, provenanceId, record }` where `commitId` is the amended
-   commit that carries the provenance id in its `provenance` list.
+1. writes `files` (a `Record<path, string | Uint8Array>`) into the working dir
+   of the checked-out layer,
+2. checkpoints the layer (`repo.checkpoint`) with a structured message
+   (`agent(<adapter>): <prompt summary>` plus `Javelin-Agent:` /
+   `Javelin-Model:` / `Javelin-Session:` / `Javelin-Parent-Run:` trailers),
+   producing a new immutable state,
+3. records a `ProvenanceRecord` via `@javelin/provenance` with
+   `states: [checkpointId]` — a standalone append-only object,
+4. returns `{ stateId, provenanceId, record }`.
 
-`commitWithProvenance(repo, { adapter, session, model, prompt, message, files? })`
-is the CLI-facing wrapper (the CLI itself lives in a sibling package).
+Recording provenance never mutates the state: state ids are stable before and
+after, and the layer head only moves through new checkpoints.
+
+The caller picks the layer up front (`repo.layerNew`, `repo.layerSwitch`);
+`captureAgentRun` writes to whichever layer is checked out.
 
 ## Adapters
 
@@ -56,16 +62,18 @@ Parses `<session-id>.jsonl` files:
 `runChain(repo, [{ spec, files }, ...])` captures runs sequentially and links
 each to the previous run's `provenanceId` via `parentRun`. A chain across
 agents (e.g. Codex plans, Claude implements, Codex tests) resolves into a
-parent graph through `resolveRunGraph` from `@javelin/provenance`.
+parent graph through `runGraph` from `@javelin/provenance`.
 
 ## Example
 
 ```ts
-import { openRepository } from "@javelin/vcs";
-import { resolveRunGraph } from "@javelin/provenance";
+import { init } from "@javelin/vcs";
+import { runGraph } from "@javelin/provenance";
 import { captureAgentRun, runChain, readCodexSessions, codexToSpec } from "@javelin/agents";
 
-const repo = await openRepository("/path/to/repo");
+const repo = await init("/path/to/repo");
+await repo.layerNew("agent-work");
+await repo.layerSwitch("agent-work");
 
 // manual capture
 await captureAgentRun(
@@ -85,12 +93,12 @@ await runChain(repo, [
   { spec: { agent: "claude-code", adapter: "claude-code", prompt: "Implement the API", session: "cc1" }, files: { "src/api.ts": "..." } },
 ]);
 
-console.log(await resolveRunGraph(repo));
+console.log(await runGraph(repo));
 ```
 
 ## Scope notes
 
-- Per assumptions.md item 12, adapters degrade to the generic adapter when no
-  local session logs exist; parsers are written against the observed Codex CLI
+- Adapters degrade gracefully when no local session logs exist; parsers are
+  written against the observed Codex CLI
   (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`) and Claude Code
   (`~/.claude/projects/**/*.jsonl`) formats and tolerate drift.

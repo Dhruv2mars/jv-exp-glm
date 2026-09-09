@@ -1,30 +1,36 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { objectId, type ObjectId, type ProvenanceRecord } from "@javelin/protocol";
-import { openRepository, type Repository } from "@javelin/vcs";
-import { getProvenance, queryRuns, recordProvenance, resolveRunGraph } from "./index";
+import type { ObjectId, ProvenanceRecord, State } from "../../protocol/src/model";
+import { init, type Repository } from "@javelin/vcs";
+import { provenanceFor, queryRuns, recordRun, runGraph } from "./index";
 
 let root: string;
+let repo: Repository;
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "jvl-prov-"));
+  repo = await init(root);
+  await repo.layerNew("work");
+  await repo.layerSwitch("work");
 });
 afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-async function commitFile(repo: Repository, path: string, content: string, message: string): Promise<ObjectId> {
-  await mkdir(join(root, path, ".."), { recursive: true });
-  await writeFile(join(root, path), content);
-  await repo.stage(path, new TextEncoder().encode(content));
-  return repo.commit({ message });
+/** Checkpoint a real file change on the "work" layer and return the state id. */
+async function checkpointFile(path: string, content: string, message: string): Promise<ObjectId> {
+  const abs = join(root, path);
+  await mkdir(join(abs, ".."), { recursive: true });
+  await writeFile(abs, content);
+  const { stateId } = await repo.checkpoint({ message });
+  return stateId;
 }
 
-function run(overrides: Partial<ProvenanceRecord> = {}): ProvenanceRecord {
+function run(overrides: Partial<Omit<ProvenanceRecord, "kind">> = {}): Omit<ProvenanceRecord, "kind"> {
   return {
-    kind: "provenance",
+    states: [],
     agent: { name: "builder", adapter: "claude-code" },
     startedAt: "2026-09-09T00:00:00Z",
     exit: "success",
@@ -32,110 +38,83 @@ function run(overrides: Partial<ProvenanceRecord> = {}): ProvenanceRecord {
   };
 }
 
-describe("provenance", () => {
-  test("record then get round-trips through the object store", async () => {
-    const repo = await openRepository(root);
-    const c1 = await commitFile(repo, "a.txt", "one", "first");
-    const record = run({ summary: "wrote a.txt" });
-    const { provenanceId, commitId } = await recordProvenance(repo, c1, record);
-    expect(commitId).not.toBe(c1);
+describe("provenance v2", () => {
+  test("recordRun writes a standalone object; provenanceFor finds it by state", async () => {
+    const stateId = await checkpointFile("a.txt", "one", "first");
+    const record = run({ states: [stateId], summary: "wrote a.txt" });
+    const provenanceId = await recordRun(repo, record);
 
-    const records = await getProvenance(repo, commitId);
-    expect(records).toEqual([record]);
-    const amended = await repo.loadCommit(commitId);
-    expect(amended.provenance).toEqual([provenanceId]);
-    expect(amended.message).toBe("first");
-    expect(amended.tree).toBe((await repo.loadCommit(c1)).tree);
+    const hits = await provenanceFor(repo, stateId);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.id).toBe(provenanceId);
+    expect(hits[0]!.record).toEqual({ kind: "provenance", ...record });
   });
 
-  test("provenance ids are content-addressed and attachment is idempotent", async () => {
-    const repo = await openRepository(root);
-    const c1 = await commitFile(repo, "a.txt", "one", "first");
-    const record = run();
-    const first = await recordProvenance(repo, c1, record);
-    const head = await repo.resolveToCommit("main");
-    const second = await recordProvenance(repo, head, record);
-    expect(first.provenanceId).toBe(second.provenanceId);
-    expect(second.attached).toBe(false);
-    expect(second.commitId).toBe(head);
-    expect(await getProvenance(repo, head)).toHaveLength(1);
+  test("recording never mutates states: ids, state content, and heads are unchanged", async () => {
+    const stateId = await checkpointFile("a.txt", "one", "first");
+    const before: State = await repo.loadState(stateId);
+    const headBefore = (await repo.layerGet("work"))!.head;
+    const worldBefore = await repo.worldHead();
+
+    await recordRun(repo, run({ states: [stateId] }));
+    await recordRun(repo, run({ states: [stateId], agent: { name: "fixer", adapter: "codex" } }));
+
+    expect(await repo.loadState(stateId)).toEqual(before);
+    expect((await repo.layerGet("work"))!.head).toBe(headBefore);
+    expect(await repo.worldHead()).toBe(worldBefore);
   });
 
-  test("queryRuns filters by agent, adapter, exit, and since", async () => {
-    const repo = await openRepository(root);
-    const c1 = await commitFile(repo, "a.txt", "one", "first");
-    await recordProvenance(repo, c1, run({ summary: "run-a" }));
-    let head = await repo.resolveToCommit("main");
-    const c2 = await commitFile(repo, "b.txt", "two", "second");
-    await recordProvenance(repo, c2, run({
+  test("queryRuns filters stored records by agent, adapter, and exit", async () => {
+    const s1 = await checkpointFile("a.txt", "one", "first");
+    await recordRun(repo, run({ states: [s1], summary: "run-a" }));
+    const s2 = await checkpointFile("b.txt", "two", "second");
+    await recordRun(repo, run({
+      states: [s2],
       agent: { name: "fixer", adapter: "codex" },
-      startedAt: "2026-09-10T00:00:00Z",
+      startedAt: "2026-09-09T01:00:00Z",
       exit: "failure",
+      summary: "run-b",
     }));
-    head = await repo.resolveToCommit("main");
-    const c3 = await commitFile(repo, "c.txt", "three", "third");
-    await recordProvenance(repo, c3, run({
+    const s3 = await checkpointFile("c.txt", "three", "third");
+    await recordRun(repo, run({
+      states: [s3],
       agent: { name: "fixer", adapter: "generic" },
-      startedAt: "2026-09-11T00:00:00Z",
-      exit: "success",
+      startedAt: "2026-09-09T02:00:00Z",
+      summary: "run-c",
     }));
 
-    expect((await queryRuns(repo, { agentName: "fixer" })).length).toBe(2);
-    expect((await queryRuns(repo, { adapter: "codex" })).length).toBe(1);
-    expect((await queryRuns(repo, { exit: "failure" })).length).toBe(1);
-    expect((await queryRuns(repo, { since: "2026-09-10T12:00:00Z" })).length).toBe(1);
-    expect((await queryRuns(repo, { agentName: "fixer", adapter: "generic" })).length).toBe(1);
-    expect((await queryRuns(repo)).length).toBe(3);
+    expect((await queryRuns(repo, { agentName: "fixer" })).map((r) => r.record.summary)).toEqual(["run-b", "run-c"]);
+    expect((await queryRuns(repo, { adapter: "codex" })).map((r) => r.record.summary)).toEqual(["run-b"]);
+    expect((await queryRuns(repo, { exit: "failure" })).map((r) => r.record.summary)).toEqual(["run-b"]);
+    expect((await queryRuns(repo, { agentName: "fixer", adapter: "generic" })).map((r) => r.record.summary)).toEqual(["run-c"]);
+    expect(await queryRuns(repo)).toHaveLength(3);
   });
 
-  test("run graph resolves parentRun links across commits", async () => {
-    const repo = await openRepository(root);
-    const c1 = await commitFile(repo, "a.txt", "one", "first");
-    const parent = await recordProvenance(repo, c1, run({ summary: "parent run" }));
-    const c2 = await commitFile(repo, "b.txt", "two", "second");
-    await recordProvenance(repo, c2, run({ parentRun: parent.provenanceId, summary: "child run" }));
+  test("runGraph resolves parentRun chains into a DAG with roots", async () => {
+    const s1 = await checkpointFile("a.txt", "one", "first");
+    const r1 = await recordRun(repo, run({ states: [s1], startedAt: "2026-09-09T00:00:00Z", summary: "root" }));
+    const s2 = await checkpointFile("b.txt", "two", "second");
+    const r2 = await recordRun(repo, run({ states: [s2], parentRun: r1, startedAt: "2026-09-09T01:00:00Z", summary: "child" }));
+    const s3 = await checkpointFile("c.txt", "three", "third");
+    const r3 = await recordRun(repo, run({ states: [s3], parentRun: r2, startedAt: "2026-09-09T02:00:00Z", summary: "grandchild" }));
+    const s4 = await checkpointFile("d.txt", "four", "fourth");
+    const r4 = await recordRun(repo, run({ states: [s4], agent: { name: "other", adapter: "codex" }, startedAt: "2026-09-09T03:00:00Z" }));
 
-    const graph = await resolveRunGraph(repo);
-    expect(graph.nodes).toHaveLength(2);
-    expect(graph.edges).toEqual([{ parent: parent.provenanceId, child: graph.nodes.find((n) => n.record.parentRun)!.id }]);
-    expect(graph.roots).toEqual([parent.provenanceId]);
+    const graph = await runGraph(repo);
+    expect(graph.nodes).toHaveLength(4);
+    expect(graph.edges).toEqual([
+      { parent: r1, child: r2 },
+      { parent: r2, child: r3 },
+    ]);
+    expect(graph.roots.sort()).toEqual([r1, r4].sort());
+    expect(graph.roots).not.toContain(r3);
   });
 
-  test("provenance survives a merge commit", async () => {
-    const repo = await openRepository(root);
-    const rawBase = await commitFile(repo, "a.txt", "base", "base");
-    const { commitId: base } = await recordProvenance(repo, rawBase, run({ summary: "base run" }));
-
-    await repo.createBranch("side");
-    const side = await commitFile(repo, "b.txt", "side", "side commit");
-    await repo.checkout("main");
-    await commitFile(repo, "c.txt", "main", "main commit");
-    const merge = await repo.mergeBranch("side");
-    expect(merge.ok).toBe(true);
-
-    const mergeRun = await recordProvenance(repo, merge.commitId!, run({ summary: "merge run" }));
-    const head = mergeRun.commitId;
-
-    expect((await getProvenance(repo, base)).map((r) => r.summary)).toEqual(["base run"]);
-    const logIds = (await repo.log("main")).map((e) => e.id);
-    expect(logIds).toContain(base);
-    expect((await getProvenance(repo, side)).length).toBe(0);
-    const mergeRecords = await getProvenance(repo, head);
-    expect(mergeRecords.map((r) => r.summary)).toEqual(["merge run"]);
-
-    const graph = await resolveRunGraph(repo);
-    expect(graph.nodes).toHaveLength(2);
-    expect(graph.roots.length).toBe(2);
-    const mergeHeadCommit = await repo.loadCommit(head);
-    expect(mergeHeadCommit.provenance?.length).toBe(1);
-  });
-
-  test("recordProvenance rejects commits no ref points at", async () => {
-    const repo = await openRepository(root);
-    const c1 = await commitFile(repo, "a.txt", "one", "first");
-    const c2 = await commitFile(repo, "b.txt", "two", "second");
-    const err = await recordProvenance(repo, c1, run()).catch((e) => e);
-    expect(err).toBeInstanceOf(Error);
-    expect(objectId(c2)).toBeDefined();
+  test("a parentRun pointing at a missing record yields no edge, not a crash", async () => {
+    const s1 = await checkpointFile("a.txt", "one", "first");
+    await recordRun(repo, run({ states: [s1], parentRun: "f".repeat(64) }));
+    const graph = await runGraph(repo);
+    expect(graph.nodes).toHaveLength(1);
+    expect(graph.edges).toEqual([]);
   });
 });

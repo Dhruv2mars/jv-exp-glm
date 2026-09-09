@@ -1,12 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { importFromGit, exportToGit } from "./index";
+import type { ObjectId } from "@javelin/protocol";
+import { openRepository } from "@javelin/vcs";
+import { exportToGit, importFromGit } from "./index";
 
-const run = promisify(execFile);
 let base: string;
 
 beforeEach(async () => {
@@ -23,172 +22,236 @@ async function sh(cwd: string, cmd: string): Promise<string> {
   return out;
 }
 
+const ENV = 'GIT_AUTHOR_DATE="2026-01-01T00:00:00 +0000" GIT_COMMITTER_DATE="2026-01-01T00:00:00 +0000"';
+
 async function makeGitRepo(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true });
-  const env = 'GIT_AUTHOR_DATE="2026-01-01T00:00:00 +0000" GIT_COMMITTER_DATE="2026-01-01T00:00:00 +0000"';
   await sh(dir, `
     git init -q -b main .
     git config user.name "Alice Dev"
     git config user.email "alice@example.com"
-    echo "hello v1" > a.txt
+    echo "hello v2" > a.txt
     mkdir sub && echo "nested content" > sub/b.txt
     echo "#!/bin/sh" > run.sh && chmod +x run.sh
-    git add . && ${env} git commit -q -m "initial commit"
+    echo real > target.txt && ln -s target.txt link.txt
+    git add . && ${ENV} git commit -q -m "initial commit"
     git checkout -qb feature
     echo "feature line" >> a.txt
-    git add . && ${env} git commit -q -m "feature work"
+    git add . && ${ENV} git commit -q -m "feature work"
     git checkout -q main
     echo "main line" > c.txt
-    git add . && ${env} git commit -q -m "main work"
-    ${env} git merge -q --no-ff feature -m "merge feature into main"
-    GIT_COMMITTER_DATE="2026-01-01T00:00:00 +0000" git tag -a v1.0 -m "release v1.0"
+    git add . && ${ENV} git commit -q -m "main work"
+    ${ENV} git merge -q --no-ff feature -m "merge feature into main"
+    ${ENV} git tag -a v1.0 -m "release v1.0"
     git checkout -qb topic
     echo "topic" > t.txt
-    git add . && ${env} git commit -q -m "topic commit"
+    git add . && ${ENV} git commit -q -m "topic commit"
     git checkout -q main
   `);
 }
 
-function flatOf(logOutput: string): string[] {
-  return logOutput.trim().split("\n").filter(Boolean);
+interface FlatFile {
+  mode: string;
+  content: string;
+}
+
+const GIT_MODE_NAMES: Record<string, string> = { "100644": "file", "100755": "exec", "120000": "symlink" };
+
+/** Flatten any state into path -> { mode name, decoded content }. */
+async function flattenState(jvlDir: string, stateId: ObjectId): Promise<Record<string, FlatFile>> {
+  const repo = await openRepository(jvlDir);
+  const state = await repo.loadState(stateId);
+  const out: Record<string, FlatFile> = {};
+  const walk = async (treeId: ObjectId, dir: string): Promise<void> => {
+    for (const entry of (await repo.loadTree(treeId)).entries) {
+      const full = dir ? `${dir}/${entry.name}` : entry.name;
+      if (entry.kind === "tree") {
+        await walk(entry.id, full);
+      } else {
+        out[full] = {
+          mode: entry.mode,
+          content: new TextDecoder().decode(await repo.readBlob(entry.id)),
+        };
+      }
+    }
+  };
+  await walk(state.tree, "");
+  return out;
+}
+
+async function gitTree(dir: string, ref: string): Promise<Record<string, FlatFile>> {
+  const raw = await sh(dir, `git ls-tree -r -z ${ref}`);
+  const out: Record<string, FlatFile> = {};
+  for (const record of raw.split("\0").filter(Boolean)) {
+    const tab = record.indexOf("\t");
+    const [mode, , hash] = record.slice(0, tab).split(" ") as [string, string, string];
+    out[record.slice(tab + 1)] = {
+      mode: GIT_MODE_NAMES[mode] ?? mode,
+      content: await sh(dir, `git cat-file blob ${hash}`),
+    };
+  }
+  return out;
 }
 
 describe("importFromGit", () => {
-  test("imports files, history shape, exec bit, branches and tags", async () => {
+  test("imports mainline into World with modes, layers per branch, and merge parents", async () => {
     const gitDir = join(base, "src-repo");
     const jvlDir = join(base, "jvl");
     await makeGitRepo(gitDir);
 
-    const result = await importFromGit(gitDir, jvlDir);
-    expect(result.warnings).toEqual([]);
-    expect(result.commits).toBe(5);
-    expect(Object.keys(result.refs).sort()).toEqual(["refs/heads/feature", "refs/heads/main", "refs/heads/topic", "refs/tags/v1.0"]);
+    const report = await importFromGit(gitDir, jvlDir);
+    expect(report.warnings).toEqual([]);
+    expect(report.counts.states).toBe(5);
+    expect(report.counts.branches).toBe(2);
 
-    const { openRepository } = await import("@javelin/vcs");
     const repo = await openRepository(jvlDir);
+    expect(report.worldHead).not.toBeNull();
+    const world = report.worldHead!;
+    expect(await repo.worldHead()).toBe(world);
 
-    const headId = result.refs["refs/heads/main"]!;
-    const commit = await repo.loadCommit(headId);
-    expect(commit.message).toContain("merge feature into main");
-    expect(commit.parents).toHaveLength(2);
-    expect(commit.author).toEqual({ name: "Alice Dev", email: "alice@example.com", time: "2026-01-01T00:00:00.000Z" });
+    const worldHead = await repo.loadState(world);
+    expect(worldHead.message).toContain("merge feature into main");
+    expect(worldHead.author).toEqual({ name: "Alice Dev", email: "alice@example.com", time: "2026-01-01T00:00:00.000Z" });
+    expect(worldHead.parents).toHaveLength(2);
 
-    const mergeParents = await Promise.all(commit.parents.map((p) => repo.loadCommit(p)));
-    expect(mergeParents.map((c) => c.message).sort()).toEqual(["feature work\n", "main work\n"]);
-    expect(mergeParents[0]!.parents).toHaveLength(1);
+    const mergeParents = await Promise.all(worldHead.parents.map((p) => repo.loadState(p)));
+    expect(mergeParents.map((s) => s.message).sort()).toEqual(["feature work\n", "main work\n"]);
+    for (const parent of mergeParents) expect(parent.parents).toHaveLength(1);
 
-    const files = await repo.readCommitTree(headId);
-    expect(Object.keys(files).sort()).toEqual(["a.txt", "c.txt", "run.sh", "sub/b.txt"]);
-    expect(new TextDecoder().decode(await repo.readBlob(files["a.txt"]!))).toBe("hello v1\nfeature line\n");
-    expect(new TextDecoder().decode(await repo.readBlob(files["sub/b.txt"]!))).toBe("nested content\n");
+    expect(await flattenState(jvlDir, world)).toEqual(await gitTree(gitDir, "main"));
+    const runMode = (await gitTree(gitDir, "main"))["run.sh"]!.mode;
+    expect(runMode).toBe("exec");
+    const link = (await flattenState(jvlDir, world))["link.txt"]!;
+    expect(link.mode).toBe("symlink");
+    expect(link.content).toBe("target.txt");
 
-    const { loadExecSet } = await import("./import");
-    const execSet = await loadExecSet(jvlDir);
-    expect(execSet.has(files["run.sh"]!)).toBe(true);
-    expect(execSet.has(files["a.txt"]!)).toBe(false);
-
-    const featureFiles = await repo.readCommitTree(result.refs["refs/heads/feature"]!);
-    expect(new TextDecoder().decode(await repo.readBlob(featureFiles["a.txt"]!))).toBe("hello v1\nfeature line\n");
+    const feature = await repo.layerGet("feature");
+    const topic = await repo.layerGet("topic");
+    expect(feature).not.toBeNull();
+    expect(topic).not.toBeNull();
+    const featureHead = await repo.loadState(feature!.head!);
+    expect(featureHead.message).toBe("feature work\n");
+    expect(feature!.base).toBe(feature!.head!);
+    const featureFiles = await flattenState(jvlDir, feature!.head!);
+    expect(featureFiles["a.txt"]!.content).toBe("hello v2\nfeature line\n");
     expect(featureFiles["c.txt"]).toBeUndefined();
 
-    const tagId = result.refs["refs/tags/v1.0"]!;
-    const tagObj = await repo.objects.read(tagId);
-    expect(tagObj?.kind).toBe("tag");
-    if (tagObj?.kind === "tag") expect(tagObj.name).toBe("v1.0");
+    expect((await repo.loadState(topic!.base!)).message).toBe("merge feature into main\n");
+    expect((await repo.loadState(topic!.head!)).message).toBe("topic commit\n");
+    expect(report.layers.map((l) => l.name).sort()).toEqual(["feature", "topic"]);
+
+    expect(report.tags["v1.0"]).toBe(world);
+    const map = JSON.parse(await readFile(join(jvlDir, ".javelin", "bridge-map.json"), "utf8"));
+    expect(Object.keys(map.commits)).toHaveLength(5);
+    expect(map.tags["v1.0"]).toBe(world);
+    const marker = JSON.parse(await readFile(join(jvlDir, ".javelin", "bridge.json"), "utf8"));
+    expect(marker).toMatchObject({ mode: "adoption", authority: "github" });
   });
 
-  test("is idempotent on re-import", async () => {
+  test("is a no-op on a second full import", async () => {
     const gitDir = join(base, "src-repo");
     const jvlDir = join(base, "jvl");
     await makeGitRepo(gitDir);
 
     const first = await importFromGit(gitDir, jvlDir);
-    const { openRepository } = await import("@javelin/vcs");
-    const repo = await openRepository(jvlDir);
-    const afterFirst = Object.fromEntries(Object.entries(first.refs).sort());
+    const mapBefore = await readFile(join(jvlDir, ".javelin", "bridge-map.json"), "utf8");
 
     const second = await importFromGit(gitDir, jvlDir);
-    expect(second.refs).toEqual(afterFirst);
-    expect(second.commits).toBe(first.commits);
+    expect(second.counts.imported).toBe(0);
+    expect(second.worldHead).toBe(first.worldHead);
+    expect(second.counts.states).toBe(first.counts.states);
     expect(second.warnings).toEqual([]);
-    expect(await repo.refs.list()).toEqual(afterFirst);
+    expect(await readFile(join(jvlDir, ".javelin", "bridge-map.json"), "utf8")).toBe(mapBefore);
   });
 
-  test("reports a warning for symlinks and skips them", async () => {
-    const gitDir = join(base, "sym-repo");
-    const jvlDir = join(base, "jvl-sym");
-    await mkdir(gitDir, { recursive: true });
+  test("imports only new commits incrementally and advances the world head", async () => {
+    const gitDir = join(base, "src-repo");
+    const jvlDir = join(base, "jvl");
+    await makeGitRepo(gitDir);
+
+    const first = await importFromGit(gitDir, jvlDir);
+    const mapBefore = JSON.parse(await readFile(join(jvlDir, ".javelin", "bridge-map.json"), "utf8"));
+
     await sh(gitDir, `
-      git init -q -b main .
-      git config user.name "S"
-      git config user.email "s@x.com"
-      echo real > target.txt
-      ln -s target.txt link.txt
-      git add -A && git commit -q -m "with symlink"
+      echo "more main" >> c.txt
+      git add . && ${ENV} git commit -q -m "second main work"
     `);
-    const result = await importFromGit(gitDir, jvlDir);
-    expect(result.warnings.some((w) => w.includes("link.txt"))).toBe(true);
+
+    const second = await importFromGit(gitDir, jvlDir);
+    expect(second.warnings).toEqual([]);
+    expect(second.counts.imported).toBe(1);
+    expect(second.counts.states).toBe(first.counts.states + 1);
+    const mapAfter = JSON.parse(await readFile(join(jvlDir, ".javelin", "bridge-map.json"), "utf8"));
+    expect(Object.keys(mapAfter.commits)).toHaveLength(Object.keys(mapBefore.commits).length + 1);
+
+    const repo = await openRepository(jvlDir);
+    const head = await repo.loadState(second.worldHead!);
+    expect(head.message).toBe("second main work\n");
+    expect(head.parents).toEqual([first.worldHead!]);
+    const content = await flattenState(jvlDir, second.worldHead!);
+    expect(content["c.txt"]!.content).toBe("main line\nmore main\n");
+
+    const third = await importFromGit(gitDir, jvlDir);
+    expect(third.counts.imported).toBe(0);
+    expect(third.worldHead).toBe(second.worldHead);
   });
 });
 
 describe("exportToGit round-trip", () => {
-  test("exported git repo matches original content, parents, messages", async () => {
+  test("exported git repo matches original structure, authors, modes, and contents", async () => {
     const gitDir = join(base, "src-repo");
     const jvlDir = join(base, "jvl");
     const outDir = join(base, "out-repo");
     await makeGitRepo(gitDir);
-    await importFromGit(gitDir, jvlDir);
+    const report = await importFromGit(gitDir, jvlDir);
+
     const result = await exportToGit(jvlDir, outDir);
     expect(result.warnings).toEqual([]);
     expect(result.commits).toBe(5);
+    expect(Object.keys(result.refs).sort()).toEqual(["refs/heads/feature", "refs/heads/main", "refs/heads/topic"]);
 
-    const branches = flatOf(await sh(outDir, "git for-each-ref --format='%(refname)' refs/heads refs/tags")).sort();
-    expect(branches).toEqual(["refs/heads/feature", "refs/heads/main", "refs/heads/topic", "refs/tags/v1.0"]);
+    const branches = (await sh(outDir, "git for-each-ref --format='%(refname)' refs/heads")).trim().split("\n").sort();
+    expect(branches).toEqual(["refs/heads/feature", "refs/heads/main", "refs/heads/topic"]);
 
-    const logOf = async (dir: string, ref: string) =>
-      flatOf(await sh(dir, `git log --format="%s|%P" ${ref}`)).sort();
-    expect(await logOf(outDir, "main")).toEqual(await logOf(gitDir, "main"));
-    expect(await logOf(outDir, "topic")).toEqual(await logOf(gitDir, "topic"));
+    const shape = async (dir: string, ref: string) =>
+      (await sh(dir, `git log --format='%s|%P' ${ref}`)).trim().split("\n").map((l) => {
+        const [subject, parents] = l.split("|");
+        return `${subject}|${parents!.split(" ").filter(Boolean).length}`;
+      }).sort();
+    expect(await shape(outDir, "main")).toEqual(await shape(gitDir, "main"));
+    expect(await shape(outDir, "feature")).toEqual(await shape(gitDir, "feature"));
+    expect(await shape(outDir, "topic")).toEqual(await shape(gitDir, "topic"));
 
-    await sh(outDir, "git checkout -q main");
-    const mainTrees = async (dir: string) =>
-      (await sh(dir, "git ls-tree -r main")).split("\n").filter(Boolean).sort();
-    expect(await mainTrees(outDir)).toEqual(await mainTrees(gitDir));
-
-    for (const path of ["a.txt", "sub/b.txt", "c.txt"]) {
-      const content = (dir: string) => sh(dir, `git show main:${path}`);
-      expect(await content(outDir)).toEqual(await content(gitDir));
-    }
-    expect(await sh(outDir, "git ls-tree main run.sh")).toBe(await sh(gitDir, "git ls-tree main run.sh"));
-    expect((await sh(outDir, "git ls-tree -r main")).includes("100755")).toBe(true);
-
-    const authors = async (dir: string) => flatOf(await sh(dir, 'git log --format="%an|%ae" main')).sort();
+    const authors = async (dir: string) =>
+      (await sh(dir, 'git log --format="%an|%ae" main')).trim().split("\n").sort();
     expect(await authors(outDir)).toEqual(await authors(gitDir));
+
+    expect(await gitTree(outDir, "main")).toEqual(await gitTree(gitDir, "main"));
+    expect((await sh(outDir, "git ls-tree main")).includes("100755")).toBe(true);
+    expect(await sh(outDir, "git show main:link.txt")).toBe(await sh(gitDir, "git show main:link.txt"));
+    expect((await sh(outDir, "git ls-tree main link.txt")).includes("120000")).toBe(true);
+    await sh(outDir, "git checkout -q main");
+    expect((await sh(outDir, "readlink link.txt")).trim()).toBe("target.txt");
+
+    const marker = JSON.parse(await readFile(join(jvlDir, ".javelin", "bridge.json"), "utf8"));
+    expect(marker).toMatchObject({ mode: "native", authority: "javelin" });
   });
 
-  test("round-trips through a second Javelin repo with identical content", async () => {
+  test("re-importing the export produces identical world content", async () => {
     const gitDir = join(base, "src-repo");
-    const jvl1 = join(base, "jvl1");
-    const jvl2 = join(base, "jvl2");
+    const jvlDir1 = join(base, "jvl1");
+    const jvlDir2 = join(base, "jvl2");
     const outDir = join(base, "out-repo");
     await makeGitRepo(gitDir);
-    await importFromGit(gitDir, jvl1);
-    await exportToGit(jvl1, outDir);
-    const second = await importFromGit(outDir, jvl2);
+    const first = await importFromGit(gitDir, jvlDir1);
+    await exportToGit(jvlDir1, outDir);
+    const second = await importFromGit(outDir, jvlDir2);
     expect(second.warnings).toEqual([]);
+    expect(second.counts.states).toBe(5);
 
-    const { openRepository } = await import("@javelin/vcs");
-    const [r1, r2] = [await openRepository(jvl1), await openRepository(jvl2)];
-    const heads = [r1, r2].map(async (r) => {
-      const head = (await r.refs.get("refs/heads/main"))!;
-      const files = await r.readCommitTree(head);
-      const out: Record<string, string> = {};
-      for (const [path, id] of Object.entries(files)) {
-        out[path] = new TextDecoder().decode(await r.readBlob(id));
-      }
-      return out;
-    });
-    expect(await heads[1]).toEqual(await heads[0]);
-    expect(second.commits).toBe(5);
+    const world1 = await flattenState(jvlDir1, first.worldHead!);
+    const world2 = await flattenState(jvlDir2, second.worldHead!);
+    expect(world2).toEqual(world1);
+    expect(Object.keys(world1).sort()).toEqual(["a.txt", "c.txt", "link.txt", "run.sh", "sub/b.txt", "target.txt"]);
   });
 });
