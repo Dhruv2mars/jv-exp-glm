@@ -1,24 +1,36 @@
-import { mkdir, readFile, rename, readdir } from "node:fs/promises";
+import { mkdir, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
-import type { ObjectId, SearchHit } from "@javelin/protocol";
-import { isObjectId } from "@javelin/protocol";
+import type { ObjectId, SearchResult } from "@javelin/protocol";
 import type { Repository } from "@javelin/vcs";
+import { keysetPage, type Page } from "./cursor";
+import { cmp } from "./text";
 
 const SEARCH_DIR = "search";
+const decoder = new TextDecoder();
+const encoder = new TextEncoder();
 
-interface CommitIndex {
-  commit: ObjectId;
+type CodeHit = Extract<SearchResult, { kind: "code" }>;
+
+export interface StateIndex {
+  state: ObjectId;
   files: Record<string, ObjectId>;
-  /** Lowercased trigram -> file paths containing it. */
+  /** Lowercased trigram -> paths whose path or content contains it. */
   trigrams: Record<string, string[]>;
+}
+
+export interface CodeSearchOptions {
+  /** State whose tree is searched; defaults to the world head. */
+  stateId?: ObjectId;
+  cursor?: string;
+  limit?: number;
 }
 
 function searchDir(root: string): string {
   return join(root, ".javelin", SEARCH_DIR);
 }
 
-function indexPath(root: string, commitId: ObjectId): string {
-  return join(searchDir(root), `${commitId}.json`);
+function indexPath(root: string, stateId: ObjectId): string {
+  return join(searchDir(root), `${stateId}.json`);
 }
 
 export function trigrams(text: string): string[] {
@@ -29,133 +41,159 @@ export function trigrams(text: string): string[] {
   return [...out];
 }
 
-async function readCommitIndex(root: string, commitId: ObjectId): Promise<CommitIndex | null> {
+function contentTrigrams(content: string): string[] {
+  const out = new Set<string>();
+  for (let i = 0; i + 3 <= content.length; i++) out.add(content.slice(i, i + 3));
+  return [...out];
+}
+
+async function readStateIndex(root: string, stateId: ObjectId): Promise<StateIndex | null> {
   try {
-    const raw = JSON.parse(await readFile(indexPath(root, commitId), "utf8")) as CommitIndex;
-    if (raw.commit !== commitId || !raw.files || !raw.trigrams) return null;
-    for (const id of Object.values(raw.files)) if (!isObjectId(id)) return null;
+    const raw = JSON.parse(await readFile(indexPath(root, stateId), "utf8")) as StateIndex;
+    if (raw.state !== stateId || !raw.files || !raw.trigrams) return null;
+    for (const id of Object.values(raw.files)) if (typeof id !== "string" || !/^[0-9a-f]{64}$/.test(id)) return null;
     return raw;
   } catch {
     return null;
   }
 }
 
-async function writeCommitIndex(root: string, index: CommitIndex): Promise<void> {
+async function writeStateIndex(root: string, index: StateIndex): Promise<void> {
   const dir = searchDir(root);
   await mkdir(dir, { recursive: true });
-  const path = indexPath(root, index.commit);
   const tmp = join(dir, `.tmp-${crypto.randomUUID()}`);
   await Bun.write(tmp, JSON.stringify(index) + "\n");
-  await rename(tmp, path);
+  await rename(tmp, indexPath(root, index.state));
+}
+
+async function flattenTree(repo: Repository, treeId: ObjectId): Promise<Record<string, ObjectId>> {
+  const files: Record<string, ObjectId> = {};
+  const walk = async (id: ObjectId, dir: string): Promise<void> => {
+    for (const entry of (await repo.loadTree(id)).entries) {
+      const full = dir ? `${dir}/${entry.name}` : entry.name;
+      if (entry.kind === "tree") await walk(entry.id, full);
+      else files[full] = entry.id;
+    }
+  };
+  await walk(treeId, "");
+  return files;
+}
+
+export async function hasIndex(repo: Repository, stateId: ObjectId): Promise<boolean> {
+  return (await readStateIndex(repo.root, stateId)) !== null;
 }
 
 /**
- * Build (or rebuild) the code search index for one commit, persisted at
- * `.javelin/search/<commitId>.json`. Deterministic and idempotent: indexing the
- * same commit twice produces byte-identical output.
+ * Build the code search index for one state's tree, persisted at
+ * `.javelin/search/<stateId>.json`. Deterministic and idempotent: indexing the
+ * same state twice produces identical output.
  */
-export async function indexCommit(repo: Repository, commitId: ObjectId): Promise<void> {
-  const files = await repo.readCommitTree(commitId);
-  const trigrams: Record<string, Set<string>> = {};
+export async function indexCommit(repo: Repository, stateId: ObjectId): Promise<void> {
+  const state = await repo.loadState(stateId);
+  const files = await flattenTree(repo, state.tree);
+  const trigramMap: Record<string, Set<string>> = {};
   for (const [path, id] of Object.entries(files)) {
     let content = "";
     try {
-      content = new TextDecoder().decode(await repo.readBlob(id)).toLowerCase();
+      content = decoder.decode(await repo.readBlob(id)).toLowerCase();
     } catch {
       content = "";
     }
-    for (const t of trigramSet(path.toLowerCase(), content)) {
-      (trigrams[t] ??= new Set()).add(path);
-    }
+    for (const t of trigrams(path.toLowerCase())) (trigramMap[t] ??= new Set()).add(path);
+    for (const t of contentTrigrams(content)) (trigramMap[t] ??= new Set()).add(path);
   }
-  const index: CommitIndex = {
-    commit: commitId,
+  const index: StateIndex = {
+    state: stateId,
     files,
-    trigrams: Object.fromEntries([...Object.entries(trigrams)].sort(([a], [b]) => (a < b ? -1 : 1)).map(([t, ps]) => [t, [...ps].sort()])),
+    trigrams: Object.fromEntries(
+      Object.entries(trigramMap)
+        .sort(([a], [b]) => cmp(a, b))
+        .map(([t, paths]) => [t, [...paths].sort()]),
+    ),
   };
-  await writeCommitIndex(repo.root, index);
+  await writeStateIndex(repo.root, index);
 }
 
-function trigramSet(path: string, content: string): string[] {
-  const out = new Set<string>();
-  for (const t of trigrams(path)) out.add(t);
-  for (let i = 0; i + 3 <= content.length; i++) out.add(content.slice(i, i + 3));
-  return [...out];
-}
-
-async function latestIndexedCommit(root: string): Promise<ObjectId | null> {
-  const dir = searchDir(root);
-  let names: string[];
-  try {
-    names = await readdir(dir);
-  } catch {
-    return null;
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, from = 0): number {
+  if (needle.length === 0) return from;
+  const last = haystack.length - needle.length;
+  for (let i = from; i <= last; i++) {
+    let matched = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return i;
   }
-  const ids = names.filter((n) => isObjectId(n.replace(/\.json$/, ""))).sort();
-  const last = ids.at(-1);
-  return last ? last.replace(/\.json$/, "") as ObjectId : null;
+  return -1;
+}
+
+function countOccurrencesBytes(haystack: Uint8Array, needle: Uint8Array): number {
+  let count = 0;
+  let at = indexOfBytes(haystack, needle);
+  while (at >= 0) {
+    count++;
+    at = indexOfBytes(haystack, needle, at + needle.length);
+  }
+  return count;
+}
+
+function lineSnippet(bytes: Uint8Array, at: number, end: number): string {
+  let start = at;
+  while (start > 0 && bytes[start - 1] !== 0x0a) start--;
+  let stop = end;
+  while (stop < bytes.length && bytes[stop] !== 0x0a) stop++;
+  return decoder.decode(bytes.slice(start, stop)).slice(0, 200);
 }
 
 /**
- * Ranked substring search over an indexed commit (defaults to HEAD, falling
- * back to the most recently indexed commit). Candidates come from the trigram
- * index, then each blob is verified against the real content, so a stale index
- * cannot produce false positives. Short queries (<3 chars) scan every file.
+ * Substring search over one state's tree (defaults to the world head, indexing
+ * it first when missing). Candidates come from the trigram index, then each
+ * blob is verified byte-exactly against the real content, so a stale index
+ * cannot produce false positives and binary files search safely. Short queries
+ * (<3 chars) scan every file. Content matching is byte-exact; paths match
+ * case-insensitively.
  */
-export async function searchCode(repo: Repository, query: string, limit = 20, commitId?: ObjectId): Promise<SearchHit[]> {
-  if (!query) return [];
-  const id = commitId ?? (await defaultCommit(repo));
-  if (!id) return [];
-  const index = await readCommitIndex(repo.root, id);
-  if (!index) return [];
-  const needle = query.toLowerCase();
-  const candidates = new Set<string>(
-    needle.length < 3 ? Object.keys(index.files) : trigrams(needle).flatMap((t) => index.trigrams[t] ?? []),
-  );
-  const hits: SearchHit[] = [];
-  for (const path of [...candidates].sort()) {
+export async function searchCode(
+  repo: Repository,
+  query: string,
+  options: CodeSearchOptions = {},
+): Promise<Page<SearchResult>> {
+  if (!query) return { hits: [] };
+  const stateId = options.stateId ?? (await repo.worldHead());
+  if (!stateId) return { hits: [] };
+  let index = await readStateIndex(repo.root, stateId);
+  if (!index) {
+    await indexCommit(repo, stateId);
+    index = await readStateIndex(repo.root, stateId);
+  }
+  if (!index) return { hits: [] };
+  const needleLower = query.toLowerCase();
+  const needleBytes = encoder.encode(query);
+  const candidates =
+    needleLower.length < 3
+      ? Object.keys(index.files).sort()
+      : [...new Set(trigrams(needleLower).flatMap((t) => index.trigrams[t] ?? []))].sort();
+  const hits: CodeHit[] = [];
+  for (const path of candidates) {
     const blobId = index.files[path];
     if (!blobId) continue;
-    let content = "";
+    let bytes: Uint8Array | null = null;
     try {
-      content = new TextDecoder().decode(await repo.readBlob(blobId));
+      bytes = await repo.readBlob(blobId);
     } catch {
-      continue;
+      bytes = null;
     }
-    const lower = content.toLowerCase();
-    const at = lower.indexOf(needle);
-    const inPath = path.toLowerCase().includes(needle);
+    const at = bytes ? indexOfBytes(bytes, needleBytes) : -1;
+    const inPath = path.toLowerCase().includes(needleLower);
     if (at < 0 && !inPath) continue;
-    const lineStart = content.lastIndexOf("\n", at) + 1;
-    const lineEnd = content.indexOf("\n", at + needle.length);
-    const snippet = at >= 0 ? content.slice(lineStart, lineEnd < 0 ? undefined : lineEnd).slice(0, 200) : "";
-    const occurrences = countOccurrences(lower, needle);
+    const occurrences = bytes && at >= 0 ? countOccurrencesBytes(bytes, needleBytes) : 0;
     const score = occurrences * 2 + (inPath ? 5 : 0) + (at === 0 ? 1 : 0);
-    hits.push({ kind: "code", path, commit: id, snippet: snippet || undefined, score });
+    const snippet = at >= 0 && bytes ? lineSnippet(bytes, at, at + needleBytes.length) : "";
+    hits.push({ kind: "code", blob: blobId, path, snippet, score });
   }
-  return hits.sort((a, b) => b.score - a.score || cmp(a.path, b.path)).slice(0, limit);
+  hits.sort((a, b) => b.score - a.score || cmp(a.path, b.path));
+  return keysetPage(hits, (h) => ({ s: h.score, k: h.path }), options.cursor, options.limit ?? 100);
 }
-
-function countOccurrences(haystack: string, needle: string): number {
-  let n = 0;
-  let i = haystack.indexOf(needle);
-  while (i >= 0) {
-    n++;
-    i = haystack.indexOf(needle, i + needle.length);
-  }
-  return n;
-}
-
-async function defaultCommit(repo: Repository): Promise<ObjectId | null> {
-  try {
-    return await repo.resolveToCommit(await repo.currentBranch());
-  } catch {
-    return latestIndexedCommit(repo.root);
-  }
-}
-
-function cmp(a: string | undefined, b: string | undefined): number {
-  return (a ?? "") < (b ?? "") ? -1 : (a ?? "") > (b ?? "") ? 1 : 0;
-}
-
-export { SEARCH_DIR };
