@@ -56,6 +56,7 @@ export interface RefreshResult {
   ok: boolean;
   stateId: ObjectId | null;
   conflicts: MergeConflict[];
+  reason: "layer-moved" | null;
 }
 
 export type PublishFailure = "not-found" | "not-open" | "conflict" | "world-moved" | "status-moved";
@@ -265,16 +266,17 @@ export class Repository {
    * nothing is written.
    */
   async refresh(layer: string): Promise<RefreshResult> {
-    const ref = await this.layerGet(layer);
-    if (!ref) throw new Error(`no such layer: ${layer}`);
+    const raw = await this.meta.get(`layer/${layer}`);
+    if (!raw) throw new Error(`no such layer: ${layer}`);
+    const ref = JSON.parse(raw) as LayerRef;
     if (!ref.head) throw new Error(`layer has no checkpoints: ${layer}`);
     const world = await this.worldHead();
     if (!world) throw new Error("world head missing");
     let base = await this.mergeBase(ref.head, world);
     if (!base && (await this.isAncestorOrSelf(ref.base, world))) base = ref.base;
-    if (!base || base === world) return { ok: true, stateId: null, conflicts: [] };
+    if (!base || base === world) return { ok: true, stateId: null, conflicts: [], reason: null };
     const { files, conflicts } = await this.mergeTrees(base, ref.head, world);
-    if (!files) return { ok: false, stateId: null, conflicts };
+    if (!files) return { ok: false, stateId: null, conflicts, reason: null };
     const treeId = await this.writeTreeFromFiles(files);
     const state: State = {
       kind: "state",
@@ -284,15 +286,14 @@ export class Repository {
       message: `refresh ${layer}`,
     };
     const { id } = await this.objects.write(state);
-    const raw = await this.meta.get(`layer/${layer}`);
     const moved = await this.meta.compareAndSwap(
       `layer/${layer}`,
-      raw!,
+      raw,
       JSON.stringify({ ...ref, head: id, updatedAt: now() } satisfies LayerRef),
     );
-    if (!moved.ok) throw new Error(`layer ${layer} moved during refresh; retry`);
+    if (!moved.ok) return { ok: false, stateId: null, conflicts: [], reason: "layer-moved" };
     await this.materialize(id);
-    return { ok: true, stateId: id, conflicts: [] };
+    return { ok: true, stateId: id, conflicts: [], reason: null };
   }
 
   // ---- contributions ----
@@ -550,7 +551,7 @@ export class Repository {
 
   // ---- merge ----
 
-  private async mergeTrees(
+  protected async mergeTrees(
     baseState: ObjectId | null,
     oursState: ObjectId,
     theirsState: ObjectId,
