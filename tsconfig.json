@@ -6,12 +6,12 @@
     "types": ["bun"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": false,
+    "exactOptionalPropertyTypes": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
     "skipLibCheck": true,
-    "noEmit": true,
-    "paths": {
-      "@javelin/protocol": ["./packages/protocol/src/index.ts"]
-    }
+    "noEmit": true
   },
-  "include": ["packages/*/src/**/*.ts", "apps/*/src/**/*.ts", "scripts/**/*.ts", "ops/**/*.ts"]
+  "include": ["src", "test"]
 }
