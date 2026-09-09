@@ -157,8 +157,8 @@ export class Repository {
       const treeId = (await repo.objects.write(makeTree([]))).id;
       const state: State = { kind: "state", tree: treeId, parents: [], author: person(), message: "init" };
       const { id } = await repo.objects.write(state);
-      const raw = await repo.meta.get("world");
-      await repo.meta.compareAndSwap("world", raw!, worldValue(id));
+      const moved = await repo.meta.compareAndSwap("world", worldValue(null), worldValue(id));
+      if (!moved.ok && (await repo.worldHead()) === null) throw new Error("world init failed; retry");
     }
     await repo.meta.create("current", "world");
     return repo;
