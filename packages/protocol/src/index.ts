@@ -165,3 +165,6 @@ export interface BackupRequest { repo?: string }
 export interface BackupResponse { archive: string; repos: string[]; at: string }
 
 export const JRP_PROTOCOL_VERSION = 1;
+
+// JRP v2 wire contract (normative spec: docs/jrp-spec.md). Additive to v1 above.
+export * from "./jrp";
