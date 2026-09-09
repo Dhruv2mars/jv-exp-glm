@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ObjectId } from "@javelin/protocol";
 import { isObjectId } from "@javelin/protocol";
@@ -39,7 +39,11 @@ export class ObjectStore {
     } catch {
       exists = false;
     }
-    if (exists) return { id, written: false };
+    if (exists) {
+      const now = new Date();
+      await utimes(path, now, now).catch(() => {});
+      return { id, written: false };
+    }
     const shard = join(this.dir, id.slice(0, 2));
     await mkdir(shard, { recursive: true });
     const tmp = join(shard, `.tmp-${crypto.randomUUID()}`);

@@ -685,11 +685,18 @@ export class Repository {
   async gc(): Promise<GcResult> {
     const keep = await this.collectReachable();
     const cutoff = Date.now() - GC_GRACE_MS;
-    let removed = 0;
+    const candidates: ObjectId[] = [];
     for (const id of await this.objects.list()) {
       if (keep.has(id)) continue;
       const mtime = await this.objects.mtime(id);
       if (mtime === null || mtime > cutoff) continue;
+      candidates.push(id);
+    }
+    if (candidates.length === 0) return { removed: 0 };
+    const fresh = await this.collectReachable();
+    let removed = 0;
+    for (const id of candidates) {
+      if (fresh.has(id)) continue;
       await this.objects.remove(id);
       removed++;
     }
