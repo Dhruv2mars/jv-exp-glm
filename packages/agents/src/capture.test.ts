@@ -1,26 +1,40 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ProvenanceRecord } from "@javelin/protocol";
-import { getProvenance, queryRuns, resolveRunGraph } from "@javelin/provenance";
-import { openRepository, type Repository } from "@javelin/vcs";
-import { captureAgentRun, commitWithProvenance, runChain, structuredMessage } from "./capture";
+import type { ObjectId } from "../../protocol/src/model";
+import { init, type Repository } from "@javelin/vcs";
+import { provenanceFor, queryRuns, runGraph } from "@javelin/provenance";
+import { captureAgentRun, runChain, structuredMessage, type FileChanges } from "./capture";
 
 let root: string;
 let repo: Repository;
 
-beforeAll(async () => {
+beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "javelin-agents-"));
-  repo = await openRepository(root);
+  repo = await init(root);
+  await repo.layerNew("agents");
+  await repo.layerSwitch("agents");
 });
-
-afterAll(async () => {
+afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
+async function blobFor(stateId: ObjectId, path: string): Promise<Uint8Array> {
+  const parts = path.split("/");
+  let tree = await repo.loadTree((await repo.loadState(stateId)).tree);
+  for (const part of parts.slice(0, -1)) {
+    const dir = tree.entries.find((e) => e.name === part && e.kind === "tree");
+    if (!dir) throw new Error(`missing directory ${part} in ${path}`);
+    tree = await repo.loadTree(dir.id);
+  }
+  const leaf = tree.entries.find((e) => e.name === parts[parts.length - 1]);
+  if (!leaf) throw new Error(`missing file ${path}`);
+  return repo.readBlob(leaf.id);
+}
+
 describe("captureAgentRun", () => {
-  test("commits files and attaches provenance with correct fields", async () => {
+  test("checkpoints the layer and references that exact state id", async () => {
     const run = await captureAgentRun(
       repo,
       {
@@ -28,83 +42,97 @@ describe("captureAgentRun", () => {
         model: "glm-4.7",
         prompt: "Fix the login bug",
         session: "sess-123",
+        adapter: "claude-code",
         exit: "success",
       },
       { "src/auth.ts": "export const fixed = true;\n" },
     );
 
-    const commit = await repo.loadCommit(run.commitId);
-    expect(commit.message).toContain("agent(generic): Fix the login bug");
-    expect(commit.message).toContain("Javelin-Agent: zai-bot");
-    expect(commit.message).toContain("Javelin-Model: glm-4.7");
-    expect(commit.message).toContain("Javelin-Session: sess-123");
+    const layer = (await repo.layerGet("agents"))!;
+    expect(layer.head).toBe(run.stateId);
+    const log = await repo.layerLog("agents");
+    expect(log.map((e) => e.id)).toContain(run.stateId);
+    expect(log[0]!.state.message).toContain("agent(claude-code): Fix the login bug");
+    expect(log[0]!.state.message).toContain("Javelin-Agent: zai-bot");
+    expect(log[0]!.state.message).toContain("Javelin-Model: glm-4.7");
+    expect(log[0]!.state.message).toContain("Javelin-Session: sess-123");
+    expect(new TextDecoder().decode(await blobFor(run.stateId, "src/auth.ts"))).toBe("export const fixed = true;\n");
 
-    const blobId = (await repo.readCommitTree(run.commitId))["src/auth.ts"];
-    expect(blobId).toBeDefined();
-    const blob = await repo.readBlob(blobId!);
-    expect(new TextDecoder().decode(blob)).toBe("export const fixed = true;\n");
-
-    const records = await getProvenance(repo, run.commitId);
-    expect(records).toHaveLength(1);
-    const rec = records[0]!;
-    expect(rec.agent).toEqual({ name: "zai-bot", adapter: "generic", session: "sess-123" });
-    expect(rec.model).toBe("glm-4.7");
-    expect(rec.prompt).toBe("Fix the login bug");
-    expect(rec.exit).toBe("success");
-    expect(rec.startedAt).toBeTruthy();
+    const hits = await provenanceFor(repo, run.stateId);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.id).toBe(run.provenanceId);
+    expect(hits[0]!.record.states).toEqual([run.stateId]);
+    expect(hits[0]!.record.agent).toEqual({ name: "zai-bot", adapter: "claude-code", session: "sess-123" });
+    expect(hits[0]!.record.model).toBe("glm-4.7");
+    expect(hits[0]!.record.prompt).toBe("Fix the login bug");
+    expect(hits[0]!.record.exit).toBe("success");
     expect(run.record.kind).toBe("provenance");
   });
 
-  test("commitWithProvenance honours adapter and custom message", async () => {
-    const run = await commitWithProvenance(repo, {
-      adapter: "codex",
-      agent: "codex",
-      session: "abc",
-      prompt: "Refactor utils",
-      message: "fix: refactor utils",
-      files: { "src/util.ts": "export const util = 1;\n" },
-    });
-    const commit = await repo.loadCommit(run.commitId);
-    expect(commit.message).toBe("fix: refactor utils");
-    const records = await getProvenance(repo, run.commitId);
-    expect((records[0] as ProvenanceRecord).agent.adapter).toBe("codex");
+  test("recording provenance leaves the state and its id unchanged", async () => {
+    const run = await captureAgentRun(repo, { agent: "a", prompt: "first" }, { "a.txt": "one" });
+    const stateBefore = await repo.loadState(run.stateId);
+    const headBefore = (await repo.layerGet("agents"))!.head;
+
+    await captureAgentRun(repo, { agent: "a", prompt: "second" }, { "b.txt": "two" });
+
+    expect(await repo.loadState(run.stateId)).toEqual(stateBefore);
+    expect((await repo.layerGet("agents"))!.head).not.toBe(headBefore);
+    const log = await repo.layerLog("agents");
+    expect(log.map((e) => e.id)).toContain(run.stateId);
+    expect(log.map((e) => e.state.message).some((m) => m.includes("agent(generic): first"))).toBe(true);
+  });
+
+  test("rejects file paths outside the repository", async () => {
+    const err = await captureAgentRun(repo, { agent: "a" }, { "../escape.txt": "nope" }).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toContain("escapes the repository");
   });
 });
 
 describe("runChain", () => {
-  test("links three runs across two agents and resolves the parent graph", async () => {
+  test("three runs across two agents resolve into a parent graph", async () => {
     const runs = await runChain(repo, [
-      { spec: { agent: "codex", adapter: "codex", model: "gpt-5-codex", prompt: "Plan the API", session: "c1" }, files: { "docs/api-plan.md": "# plan\n" } },
-      { spec: { agent: "claude-code", adapter: "claude-code", model: "claude-sonnet-4-5", prompt: "Implement the API", session: "cc1" }, files: { "src/api.ts": "export const api = {};\n" } },
-      { spec: { agent: "codex", adapter: "codex", model: "gpt-5-codex", prompt: "Test the API", session: "c2" }, files: { "src/api.test.ts": "test('api', () => {});\n" } },
+      {
+        spec: { agent: "codex", adapter: "codex", model: "gpt-5-codex", prompt: "Plan the API", session: "c1", startedAt: "2026-09-09T00:00:00Z", exit: "success" },
+        files: { "docs/api-plan.md": "# plan\n" },
+      },
+      {
+        spec: { agent: "claude-code", adapter: "claude-code", model: "claude-sonnet-4-5", prompt: "Implement the API", session: "cc1", startedAt: "2026-09-09T00:01:00Z", exit: "success" },
+        files: { "src/api.ts": "export const api = {};\n" },
+      },
+      {
+        spec: { agent: "codex", adapter: "codex", model: "gpt-5-codex", prompt: "Test the API", session: "c2", startedAt: "2026-09-09T00:02:00Z", exit: "success" },
+        files: { "src/api.test.ts": "test('api', () => {});\n" },
+      },
     ]);
     expect(runs).toHaveLength(3);
     expect(runs[1]!.record.parentRun).toBe(runs[0]!.provenanceId);
     expect(runs[2]!.record.parentRun).toBe(runs[1]!.provenanceId);
 
-    // linear commit history
-    const log = await repo.log(runs[2]!.commitId);
-    expect(log.length).toBeGreaterThanOrEqual(5);
-    const messages = log.map((e) => e.commit.message);
+    expect((await repo.layerGet("agents"))!.head).toBe(runs[2]!.stateId);
+    const log = await repo.layerLog("agents");
+    const messages = log.map((e) => e.state.message);
     expect(messages.some((m) => m.includes("Plan the API"))).toBe(true);
     expect(messages.some((m) => m.includes("Implement the API"))).toBe(true);
+    expect(messages.some((m) => m.includes("Test the API"))).toBe(true);
+    expect(new TextDecoder().decode(await blobFor(runs[2]!.stateId, "docs/api-plan.md"))).toBe("# plan\n");
+    expect(new TextDecoder().decode(await blobFor(runs[2]!.stateId, "src/api.ts"))).toBe("export const api = {};\n");
+    expect(new TextDecoder().decode(await blobFor(runs[2]!.stateId, "src/api.test.ts"))).toBe("test('api', () => {});\n");
 
-    // tree contents from each run present at the chain head
-    const files = await repo.readCommitTree(log[0]!.id);
-    expect(files["docs/api-plan.md"]).toBeDefined();
-    expect(files["src/api.ts"]).toBeDefined();
-    expect(files["src/api.test.ts"]).toBeDefined();
-
-    const graph = await resolveRunGraph(repo);
-    expect(graph.nodes.length).toBeGreaterThanOrEqual(3);
-    expect(graph.edges.some((e) => e.parent === runs[0]!.provenanceId && e.child === runs[1]!.provenanceId)).toBe(true);
-    expect(graph.edges.some((e) => e.parent === runs[1]!.provenanceId && e.child === runs[2]!.provenanceId)).toBe(true);
-    // chain tail is a root (no run links to it); the chain head has a parent
-    expect(graph.roots).toContain(runs[0]!.provenanceId);
+    const graph = await runGraph(repo);
+    expect(graph.nodes).toHaveLength(3);
+    expect(graph.edges).toEqual([
+      { parent: runs[0]!.provenanceId, child: runs[1]!.provenanceId },
+      { parent: runs[1]!.provenanceId, child: runs[2]!.provenanceId },
+    ]);
+    expect(graph.roots).toEqual([runs[0]!.provenanceId]);
     expect(graph.roots).not.toContain(runs[2]!.provenanceId);
 
-    const codexRuns = await queryRuns(repo, { adapter: "codex" });
-    expect(codexRuns.length).toBeGreaterThanOrEqual(2);
+    expect((await queryRuns(repo, { adapter: "codex" })).length).toBe(2);
+    expect((await queryRuns(repo, { agentName: "claude-code" })).length).toBe(1);
+    expect((await queryRuns(repo, { exit: "success" })).length).toBe(3);
+    expect((await queryRuns(repo, { exit: "failure" })).length).toBe(0);
   });
 
   test("structuredMessage truncates long prompts", () => {
