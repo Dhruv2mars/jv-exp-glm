@@ -1,31 +1,31 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import * as fsReal from "node:fs/promises";
-import { mkdtemp, rm } from "node:fs/promises";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const fsyncCalls: number[] = [];
-const realFsync = fsReal.fsync;
-
-mock.module("node:fs/promises", () => {
-  const mocked = {
-    ...fsReal,
-    fsync: async (target: number | { fd: number }) => {
-      const fd = typeof target === "number" ? target : target.fd;
-      fsyncCalls.push(fd);
-      return realFsync(fd as never);
-    },
-  };
-  return { ...mocked, default: mocked };
-});
+interface PatchableHandle {
+  sync: () => Promise<void>;
+}
 
 let dir: string;
+let syncCalls: number[];
+let originalSync: (() => Promise<void>) | null = null;
+let handleProto: PatchableHandle | null = null;
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "jvl-fsync-"));
-  fsyncCalls.length = 0;
+  syncCalls = [];
+  const probe = await open(join(dir, "probe"), "w");
+  handleProto = Object.getPrototypeOf(probe) as PatchableHandle;
+  await probe.close();
+  originalSync = handleProto.sync;
+  handleProto.sync = async function () {
+    syncCalls.push(1);
+    return originalSync!.call(this);
+  };
 });
 afterEach(async () => {
+  if (handleProto && originalSync) handleProto.sync = originalSync;
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -34,7 +34,7 @@ describe("durability", () => {
     const { MetaStore } = await import("./meta");
     const store = new MetaStore(join(dir, "meta"));
     await store.create("world", "v");
-    expect(fsyncCalls.length).toBeGreaterThanOrEqual(2);
+    expect(syncCalls.length).toBeGreaterThanOrEqual(2);
     expect(await store.get("world")).toBe("v");
   });
 
@@ -42,7 +42,7 @@ describe("durability", () => {
     const { ObjectStore } = await import("./store");
     const store = new ObjectStore(join(dir, "objects"));
     const { id } = await store.write({ kind: "blob", data: new TextEncoder().encode("hello") });
-    expect(fsyncCalls.length).toBeGreaterThanOrEqual(2);
+    expect(syncCalls.length).toBeGreaterThanOrEqual(2);
     expect(await store.has(id)).toBe(true);
   });
 });

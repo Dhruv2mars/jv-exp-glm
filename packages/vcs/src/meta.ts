@@ -1,4 +1,4 @@
-import { mkdir, open, readdir, readFile, rename, rm, stat, utimes, writeFile, fsync } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
@@ -178,14 +178,14 @@ export class MetaStore {
     const handle = await open(tmp, "w");
     try {
       await handle.writeFile(contents);
-      await fsync(handle.fd);
+      await handle.sync();
     } finally {
       await handle.close();
     }
     await rename(tmp, path);
     const dirHandle = await open(parent, "r");
     try {
-      await fsync(dirHandle.fd);
+      await dirHandle.sync();
     } finally {
       await dirHandle.close();
     }
