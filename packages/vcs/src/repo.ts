@@ -46,7 +46,7 @@ export interface LogEntry {
 
 export interface MergeConflict {
   path: string;
-  kind: "content" | "add-add" | "delete-modify";
+  kind: "content" | "add-add" | "delete-modify" | "binary";
   baseId: ObjectId | null;
   oursId: ObjectId | null;
   theirsId: ObjectId | null;
@@ -56,6 +56,7 @@ export interface RefreshResult {
   ok: boolean;
   stateId: ObjectId | null;
   conflicts: MergeConflict[];
+  reason: "layer-moved" | null;
 }
 
 export type PublishFailure = "not-found" | "not-open" | "conflict" | "world-moved" | "status-moved";
@@ -117,6 +118,15 @@ function worldValue(id: ObjectId | null): string {
   return JSON.stringify({ value: id });
 }
 
+/** Git's heuristic: content with a NUL byte in the first 8k is binary, not text. */
+function isBinary(bytes: Uint8Array): boolean {
+  const end = Math.min(bytes.length, 8192);
+  for (let i = 0; i < end; i++) {
+    if (bytes[i] === 0) return true;
+  }
+  return false;
+}
+
 export class Repository {
   readonly objects: ObjectStore;
   readonly meta: MetaStore;
@@ -124,7 +134,8 @@ export class Repository {
   protected constructor(
     readonly root: string,
     private readonly javelinDir: string,
-  ) {    this.objects = new ObjectStore(join(javelinDir, "objects"));
+  ) {
+    this.objects = new ObjectStore(join(javelinDir, "objects"));
     this.meta = new MetaStore(join(javelinDir, "meta"));
   }
 
@@ -132,7 +143,9 @@ export class Repository {
     const javelinDir = join(root, ".javelin");
     await mkdir(join(javelinDir, "objects"), { recursive: true });
     await mkdir(join(javelinDir, "meta"), { recursive: true });
-    return new Repository(root, javelinDir);
+    const repo = new Repository(root, javelinDir);
+    await repo.meta.cleanTemp();
+    return repo;
   }
 
   /**
@@ -147,8 +160,8 @@ export class Repository {
       const treeId = (await repo.objects.write(makeTree([]))).id;
       const state: State = { kind: "state", tree: treeId, parents: [], author: person(), message: "init" };
       const { id } = await repo.objects.write(state);
-      const raw = await repo.meta.get("world");
-      await repo.meta.compareAndSwap("world", raw!, worldValue(id));
+      const moved = await repo.meta.compareAndSwap("world", worldValue(null), worldValue(id));
+      if (!moved.ok && (await repo.worldHead()) === null) throw new Error("world init failed; retry");
     }
     await repo.meta.create("current", "world");
     return repo;
@@ -173,6 +186,9 @@ export class Repository {
 
   async layerNew(name: string): Promise<LayerRef> {
     if (!LAYER_NAME_RE.test(name)) throw new Error(`invalid layer name: ${name}`);
+    if (name === "world" || name === "current" || name.endsWith(".lock")) {
+      throw new Error(`reserved layer name: ${name}`);
+    }
     const world = await this.worldHead();
     if (!world) throw new Error("world head missing; run init first");
     const ref: LayerRef = { name, base: world, head: null, updatedAt: now() };
@@ -265,16 +281,17 @@ export class Repository {
    * nothing is written.
    */
   async refresh(layer: string): Promise<RefreshResult> {
-    const ref = await this.layerGet(layer);
-    if (!ref) throw new Error(`no such layer: ${layer}`);
+    const raw = await this.meta.get(`layer/${layer}`);
+    if (!raw) throw new Error(`no such layer: ${layer}`);
+    const ref = JSON.parse(raw) as LayerRef;
     if (!ref.head) throw new Error(`layer has no checkpoints: ${layer}`);
     const world = await this.worldHead();
     if (!world) throw new Error("world head missing");
     let base = await this.mergeBase(ref.head, world);
     if (!base && (await this.isAncestorOrSelf(ref.base, world))) base = ref.base;
-    if (!base || base === world) return { ok: true, stateId: null, conflicts: [] };
+    if (!base || base === world) return { ok: true, stateId: null, conflicts: [], reason: null };
     const { files, conflicts } = await this.mergeTrees(base, ref.head, world);
-    if (!files) return { ok: false, stateId: null, conflicts };
+    if (!files) return { ok: false, stateId: null, conflicts, reason: null };
     const treeId = await this.writeTreeFromFiles(files);
     const state: State = {
       kind: "state",
@@ -284,15 +301,14 @@ export class Repository {
       message: `refresh ${layer}`,
     };
     const { id } = await this.objects.write(state);
-    const raw = await this.meta.get(`layer/${layer}`);
     const moved = await this.meta.compareAndSwap(
       `layer/${layer}`,
-      raw!,
+      raw,
       JSON.stringify({ ...ref, head: id, updatedAt: now() } satisfies LayerRef),
     );
-    if (!moved.ok) throw new Error(`layer ${layer} moved during refresh; retry`);
+    if (!moved.ok) return { ok: false, stateId: null, conflicts: [], reason: "layer-moved" };
     await this.materialize(id);
-    return { ok: true, stateId: id, conflicts: [] };
+    return { ok: true, stateId: id, conflicts: [], reason: null };
   }
 
   // ---- contributions ----
@@ -360,6 +376,15 @@ export class Repository {
       if (!moved.ok) return this.publishFailure("status-moved");
       return { ok: true, idempotent: false, worldState: world, reason: null, conflicts: [] };
     }
+    if (await this.isAncestorOrSelf(contribution.state, world)) {
+      const event: ContributionEvent = { status: "published", at: now(), by: author.name, worldState: world };
+      await this.meta.compareAndSwap(
+        key,
+        raw,
+        JSON.stringify({ ...cmeta, status: "published", events: [...cmeta.events, event] } satisfies ContributionMeta),
+      );
+      return { ok: true, idempotent: true, worldState: world, reason: null, conflicts: [] };
+    }
     const base =
       (await this.isAncestorOrSelf(contribution.base, world))
         ? contribution.base
@@ -383,7 +408,15 @@ export class Repository {
       raw,
       JSON.stringify({ ...cmeta, status: "published", events: [...cmeta.events, event] } satisfies ContributionMeta),
     );
-    if (!statusMoved.ok) return this.publishFailure("status-moved");
+    if (!statusMoved.ok) {
+      const current = await this.meta.get(key);
+      const latest = current ? (JSON.parse(current) as ContributionMeta) : null;
+      const published = latest ? [...latest.events].reverse().find((e) => e.status === "published") : null;
+      if (latest?.status === "published" && published?.worldState === id) {
+        return { ok: true, idempotent: true, worldState: id, reason: null, conflicts: [] };
+      }
+      return this.publishFailure("status-moved");
+    }
     return { ok: true, idempotent: false, worldState: id, reason: null, conflicts: [] };
   }
 
@@ -550,7 +583,7 @@ export class Repository {
 
   // ---- merge ----
 
-  private async mergeTrees(
+  protected async mergeTrees(
     baseState: ObjectId | null,
     oursState: ObjectId,
     theirsState: ObjectId,
@@ -598,9 +631,17 @@ export class Repository {
         continue;
       }
       const mode: FileMode = o.mode !== b.mode ? o.mode : t.mode;
-      const decode = async (id: ObjectId): Promise<string[]> =>
-        splitLines(new TextDecoder().decode(await this.readBlob(id)));
-      const [baseLines, ourLines, theirLines] = await Promise.all([decode(b.id), decode(o.id), decode(t.id)]);
+      const [baseBytes, ourBytes, theirBytes] = await Promise.all([
+        this.readBlob(b.id),
+        this.readBlob(o.id),
+        this.readBlob(t.id),
+      ]);
+      if (isBinary(baseBytes) || isBinary(ourBytes) || isBinary(theirBytes)) {
+        conflicts.push({ path, kind: "binary", baseId: b.id, oursId: o.id, theirsId: t.id });
+        continue;
+      }
+      const decode = (bytes: Uint8Array): string[] => splitLines(new TextDecoder().decode(bytes));
+      const [baseLines, ourLines, theirLines] = [decode(baseBytes), decode(ourBytes), decode(theirBytes)];
       const merged = diff3(baseLines, ourLines, theirLines);
       if (!merged.lines) {
         conflicts.push({ path, kind: "content", baseId: b.id, oursId: o.id, theirsId: t.id });
@@ -684,11 +725,18 @@ export class Repository {
   async gc(): Promise<GcResult> {
     const keep = await this.collectReachable();
     const cutoff = Date.now() - GC_GRACE_MS;
-    let removed = 0;
+    const candidates: ObjectId[] = [];
     for (const id of await this.objects.list()) {
       if (keep.has(id)) continue;
       const mtime = await this.objects.mtime(id);
       if (mtime === null || mtime > cutoff) continue;
+      candidates.push(id);
+    }
+    if (candidates.length === 0) return { removed: 0 };
+    const fresh = await this.collectReachable();
+    let removed = 0;
+    for (const id of candidates) {
+      if (fresh.has(id)) continue;
       await this.objects.remove(id);
       removed++;
     }
@@ -758,12 +806,25 @@ export class Repository {
       else if (obj.kind === "tree") await markTree(id);
       else keep.add(id);
     }
-    for (const id of await this.objects.list()) {
-      if (keep.has(id)) continue;
-      const obj = await this.objects.read(id);
-      if (!obj) continue;
-      if (obj.kind === "provenance" && obj.states.some((s) => keep.has(s))) keep.add(id);
-      else if (obj.kind === "evidence" && keep.has(obj.state)) keep.add(id);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const id of await this.objects.list()) {
+        if (keep.has(id)) continue;
+        const obj = await this.objects.read(id);
+        if (!obj) continue;
+        if (obj.kind === "provenance" && obj.states.some((s) => keep.has(s))) {
+          keep.add(id);
+          changed = true;
+          for (const s of obj.states) {
+            if (!keep.has(s)) await markState(s);
+          }
+        } else if (obj.kind === "evidence" && keep.has(obj.state)) {
+          keep.add(id);
+          changed = true;
+          if (!keep.has(obj.state)) await markState(obj.state);
+        }
+      }
     }
     return keep;
   }

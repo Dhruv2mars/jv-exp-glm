@@ -19,3 +19,6 @@ The only mutable state in a Javelin repository is small: the world head, layer h
 - Concurrent CLI processes on one repository are now safe (the concurrent-agents case).
 - Multi-replica javelind still needs the durable Heads implementation; until then, single-writer javelind is the documented deployment shape.
 - Stale-lock theft trades a 10s stall for liveness after a crash; documented in operations.
+
+## Review fixes (2026-09-09)
+Lockfiles live outside the keyspace under `meta/.locks/<encoded-key>.lock`, so `.lock`-suffixed keys stay listable and cannot wedge another key's CAS. Each lock carries a random owner token: release deletes only on token match, a live holder heartbeats the lock mtime, and theft renames the stale file away. Atomic writes fsync the temp file before rename and the parent directory after, extending the crash-safety claim to power loss.

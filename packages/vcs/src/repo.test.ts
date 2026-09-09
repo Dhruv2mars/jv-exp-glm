@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ObjectId } from "../../protocol/src/model";
-import { init, openRepository, Repository, type Author, type PublishResult } from "./repo";
+import { init, openRepository, Repository, type Author, type ContributionMeta, type FileMap, type MergeConflict, type PublishResult } from "./repo";
+import { ObjectStore } from "./store";
+import { MetaStore } from "./meta";
+import type { CasResult } from "./meta";
 
 const AUTHOR: Author = { name: "agent", email: "agent@javelin.dev" };
 
@@ -68,6 +71,45 @@ describe("Repository v2", () => {
     const reopened = await openRepository(root);
     expect(await reopened.worldHead()).toBe(head);
     expect(await repo.currentLayer()).toBe("world");
+  });
+
+  test("concurrent inits converge on a single init state and one world write", async () => {
+    const objectProto = ObjectStore.prototype as unknown as {
+      write: (obj: { kind: string; parents?: ObjectId[] }) => Promise<{ id: ObjectId; written: boolean }>;
+    };
+    const metaProto = MetaStore.prototype as unknown as {
+      compareAndSwap: (key: string, expected: string | null, next: string) => Promise<CasResult>;
+    };
+    const origWrite = objectProto.write;
+    const origCas = metaProto.compareAndSwap;
+    const worldWrites: ObjectId[] = [];
+    let stalled = false;
+    try {
+      objectProto.write = async function (obj) {
+        if (obj.kind === "state" && obj.parents?.length === 0 && !stalled) {
+          stalled = true;
+          await Bun.sleep(50);
+        }
+        return origWrite.call(this, obj);
+      };
+      metaProto.compareAndSwap = async function (key, expected, next) {
+        const result = await origCas.call(this, key, expected, next);
+        if (key === "world" && result.ok && expected !== null) {
+          worldWrites.push((JSON.parse(next) as { value: ObjectId }).value);
+        }
+        return result;
+      };
+
+      const [a, b] = await Promise.all([init(root), init(root)]);
+      const headA = await a.worldHead();
+      expect(headA).not.toBeNull();
+      expect(await b.worldHead()).toBe(headA);
+      expect(await a.worldLog(10)).toHaveLength(1);
+      expect(worldWrites).toHaveLength(1);
+    } finally {
+      objectProto.write = origWrite;
+      metaProto.compareAndSwap = origCas;
+    }
   });
 
   test("lifecycle: layer, checkpoint, contribute, publish, clone-like materialize", async () => {
@@ -358,6 +400,316 @@ describe("Repository v2", () => {
     expect(result.reason).toBe("world-moved");
     expect(await repo.worldHead()).not.toBe(worldBefore);
     expect((await repo.contribution(contribId))!.meta.status).toBe("open");
+  });
+
+  test("refresh fails loudly when a checkpoint lands mid-merge, keeping the checkpoint", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "file.txt"), "one\ntwo\nthree\n");
+    });
+    const cp = await forkAndCheckpoint(repo, "work", "layer edit", async () => {
+      await writeFile(join(root, "file.txt"), "ONE\ntwo\nthree\n");
+    });
+    await publishEdit(repo, "worldside", "world edit", async () => {
+      await writeFile(join(root, "file.txt"), "one\ntwo\nTHREE\n");
+    });
+    await repo.layerSwitch("work");
+
+    class RacyRepo extends Repository {
+      injected = false;
+      constructor() {
+        super(root, join(root, ".javelin"));
+      }
+      protected override async mergeTrees(
+        baseState: ObjectId | null,
+        oursState: ObjectId,
+        theirsState: ObjectId,
+      ): Promise<{ files: FileMap | null; conflicts: MergeConflict[] }> {
+        if (!this.injected) {
+          this.injected = true;
+          const racer = await openRepository(root);
+          await racer.checkpoint({ message: "mid-merge checkpoint", author: AUTHOR, layer: "work" });
+        }
+        return super.mergeTrees(baseState, oursState, theirsState);
+      }
+    }
+    const racy = new RacyRepo();
+    const result = await racy.refresh("work");
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("layer-moved");
+
+    const head = (await repo.layerGet("work"))!.head;
+    expect(head).not.toBe(cp);
+    const headState = await repo.loadState(head!);
+    expect(headState.message).toBe("mid-merge checkpoint");
+    expect(headState.parents).toEqual([cp]);
+
+    const fsck = await repo.fsck();
+    expect(fsck.ok).toBe(true);
+    expect(fsck.unreachable).not.toContain(head!);
+  });
+
+  test("gc keeps content re-added by a checkpoint landing during the sweep", async () => {
+    const repo = await init(root);
+    await repo.layerNew("scratch");
+    await repo.layerSwitch("scratch");
+    await writeFile(join(root, "blob.bin"), "precious-content\n");
+    const cp = (await repo.checkpoint({ message: "scratch", author: AUTHOR })).stateId;
+    await repo.layerSwitch("world");
+    await repo.layerDiscard("scratch");
+    const scratchState = await repo.loadState(cp);
+    const scratchTree = await repo.loadTree(scratchState.tree);
+    const blobId = scratchTree.entries.find((entry) => entry.name === "blob.bin")!.id;
+    const past = new Date(Date.now() - 2 * 3_600_000);
+    for (const id of [cp, scratchState.tree, blobId]) {
+      await utimes(repo.objects.shardPath(id), past, past);
+    }
+
+    await forkAndCheckpoint(repo, "live", "live layer work");
+    await writeFile(join(root, "blob.bin"), "precious-content\n");
+
+    class GcRacyStore extends ObjectStore {
+      triggered = false;
+      constructor() {
+        super(join(root, ".javelin", "objects"));
+      }
+      override async mtime(id: ObjectId): Promise<number | null> {
+        if (id === blobId && !this.triggered) {
+          this.triggered = true;
+          const racer = await openRepository(root);
+          await racer.checkpoint({ message: "re-add blob", author: AUTHOR, layer: "live" });
+        }
+        return super.mtime(id);
+      }
+    }
+    (repo as { objects: ObjectStore }).objects = new GcRacyStore();
+
+    await repo.gc();
+    expect(await repo.objects.has(blobId)).toBe(true);
+
+    const liveHead = (await repo.layerGet("live"))!.head!;
+    const clone = await mkdtemp(join(tmpdir(), "jvl-clone-"));
+    clones.push(clone);
+    await repo.materialize(liveHead, clone);
+    expect(await readFile(join(clone, "blob.bin"), "utf8")).toBe("precious-content\n");
+
+    const fsck = await repo.fsck();
+    expect(fsck.ok).toBe(true);
+    expect(fsck.unreachable).not.toContain(liveHead);
+  });
+
+  test("publish retry after a crash between world CAS and status CAS does not duplicate a commit", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "file.txt"), "x\ny\n");
+    });
+    await forkAndCheckpoint(repo, "crashy", "add file", async () => {
+      await writeFile(join(root, "added.txt"), "added\n");
+    });
+    const contribId = await repo.contribute("crashy", "add a file", AUTHOR);
+
+    class CrashyRepo extends Repository {
+      crashed = false;
+      constructor() {
+        super(root, join(root, ".javelin"));
+      }
+      protected override async casWorld(expectedRaw: string, next: ObjectId): Promise<boolean> {
+        const moved = await super.casWorld(expectedRaw, next);
+        if (moved && !this.crashed) {
+          this.crashed = true;
+          throw new Error("crash: died between world CAS and status CAS");
+        }
+        return moved;
+      }
+    }
+    const crashy = new CrashyRepo();
+    await expect(crashy.publish(contribId, AUTHOR)).rejects.toThrow("crash");
+    const worldAfterCrash = await repo.worldHead();
+    const logLengthAfterCrash = (await repo.worldLog(10)).length;
+
+    const retry = await repo.publish(contribId, AUTHOR);
+    expect(retry.ok).toBe(true);
+    expect(retry.idempotent).toBe(true);
+    expect(retry.worldState).toBe(worldAfterCrash);
+    expect(await repo.worldHead()).toBe(worldAfterCrash);
+    expect(await repo.worldLog(10)).toHaveLength(logLengthAfterCrash);
+  });
+
+  test("a status CAS lost to an identical published record is an idempotent success", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "file.txt"), "x\n");
+    });
+    await forkAndCheckpoint(repo, "racy", "add file", async () => {
+      await writeFile(join(root, "added.txt"), "added\n");
+    });
+    const contribId = await repo.contribute("racy", "add a file", AUTHOR);
+
+    class RacerRepo extends Repository {
+      constructor() {
+        super(root, join(root, ".javelin"));
+      }
+      protected override async casWorld(expectedRaw: string, next: ObjectId): Promise<boolean> {
+        const moved = await super.casWorld(expectedRaw, next);
+        if (moved) {
+          const raw = await this.meta.get(`contrib/${contribId}`);
+          const cmeta = JSON.parse(raw!) as ContributionMeta;
+          await this.meta.compareAndSwap(
+            `contrib/${contribId}`,
+            raw!,
+            JSON.stringify({
+              ...cmeta,
+              status: "published",
+              events: [...cmeta.events, { status: "published", at: new Date().toISOString(), by: "racer", worldState: next }],
+            }),
+          );
+        }
+        return moved;
+      }
+    }
+    const racer = new RacerRepo();
+    const result = await racer.publish(contribId, AUTHOR);
+    expect(result.ok).toBe(true);
+    expect(result.idempotent).toBe(true);
+    expect(result.worldState).toBe(await repo.worldHead());
+
+    const stored = (await repo.contribution(contribId))!;
+    expect(stored.meta.events.filter((event) => event.status === "published")).toHaveLength(1);
+  });
+
+  test("refresh reports a binary conflict instead of merging non-UTF-8 content", async () => {
+    const repo = await init(root);
+    const binary = Buffer.from([0x61, 0x0a, 0x00, 0x80, 0xff, 0x0a, 0x62, 0x0a]);
+    const ours = Buffer.from([0x41, 0x0a, 0x00, 0x80, 0xff, 0x0a, 0x62, 0x0a]);
+    const theirs = Buffer.from([0x61, 0x0a, 0x00, 0x80, 0xff, 0x0a, 0x42, 0x0a]);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "data.bin"), binary);
+    });
+    await forkAndCheckpoint(repo, "bin", "ours edit", async () => {
+      await writeFile(join(root, "data.bin"), ours);
+    });
+    await publishEdit(repo, "worldside", "theirs edit", async () => {
+      await writeFile(join(root, "data.bin"), theirs);
+    });
+
+    const result = await repo.refresh("bin");
+    expect(result.ok).toBe(false);
+    expect(result.conflicts).toHaveLength(1);
+    expect(result.conflicts[0]!.path).toBe("data.bin");
+    expect(result.conflicts[0]!.kind).toBe("binary");
+
+    const head = (await repo.layerGet("bin"))!.head!;
+    const clone = await freshClone(repo, head);
+    expect(await readFile(join(clone, "data.bin"))).toEqual(ours);
+  });
+
+  test("layerNew rejects reserved names", async () => {
+    const repo = await init(root);
+    await expect(repo.layerNew("world")).rejects.toThrow("reserved layer name");
+    await expect(repo.layerNew("current")).rejects.toThrow("reserved layer name");
+    await expect(repo.layerNew("x.lock")).rejects.toThrow("reserved layer name");
+    await expect(repo.layerNew("ok-name")).resolves.toBeDefined();
+  });
+
+  test("a legacy notes.lock layer key is listed and stays gc-reachable", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+    });
+    const cp = await forkAndCheckpoint(repo, "tmp", "scratch", async () => {
+      await writeFile(join(root, "scratch.txt"), "scratch\n");
+    });
+    const ref = { ...(await repo.layerGet("tmp"))!, name: "notes.lock" };
+    expect(await repo.meta.create("layer/notes.lock", JSON.stringify(ref))).toBe(true);
+    await repo.layerDiscard("tmp");
+    expect((await repo.layerList()).map((entry) => entry.name)).toContain("notes.lock");
+
+    const state = await repo.loadState(cp);
+    const tree = await repo.loadTree(state.tree);
+    const scratchBlob = tree.entries.find((entry) => entry.name === "scratch.txt")!.id;
+    const past = new Date(Date.now() - 2 * 3_600_000);
+    for (const id of [cp, state.tree, scratchBlob]) {
+      await utimes(repo.objects.shardPath(id), past, past);
+    }
+    await repo.gc();
+    expect(await repo.objects.has(cp)).toBe(true);
+    expect((await repo.layerGet("notes.lock"))!.head).toBe(cp);
+  });
+
+  test("gc keeps every state a kept provenance record references", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+    });
+    const cpA = await forkAndCheckpoint(repo, "keep", "kept layer", async () => {
+      await writeFile(join(root, "one.txt"), "1\n");
+    });
+    await repo.layerNew("temp");
+    await repo.layerSwitch("temp");
+    await writeFile(join(root, "two.txt"), "2\n");
+    const cpB = (await repo.checkpoint({ message: "orphan state", author: AUTHOR })).stateId;
+    await repo.layerSwitch("keep");
+    await repo.layerDiscard("temp");
+
+    await repo.recordProvenance({
+      states: [cpA, cpB],
+      agent: { name: "agent", adapter: "generic" },
+      startedAt: new Date().toISOString(),
+      exit: "success",
+    });
+    const stateB = await repo.loadState(cpB);
+    const treeB = await repo.loadTree(stateB.tree);
+    const blobB = treeB.entries.find((entry) => entry.name === "two.txt")!.id;
+    const past = new Date(Date.now() - 2 * 3_600_000);
+    for (const id of [cpB, stateB.tree, blobB]) {
+      await utimes(repo.objects.shardPath(id), past, past);
+    }
+
+    await repo.gc();
+    expect(await repo.objects.has(cpB)).toBe(true);
+    expect((await repo.provenanceFor(cpB)).map((hit) => hit.record.states)).toContainEqual([cpA, cpB]);
+    const clone = await freshClone(repo, cpB);
+    expect(existsSync(join(clone, "two.txt"))).toBe(true);
+  });
+
+  test("gc keeps open contribution objects and their referenced states", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+    });
+    const cp = await forkAndCheckpoint(repo, "prop", "proposal", async () => {
+      await writeFile(join(root, "b.txt"), "b\n");
+    });
+    const contribId = await repo.contribute("prop", "propose b", AUTHOR);
+    await repo.layerDiscard("prop");
+
+    const state = await repo.loadState(cp);
+    const tree = await repo.loadTree(state.tree);
+    const blob = tree.entries.find((entry) => entry.name === "b.txt")!.id;
+    const past = new Date(Date.now() - 2 * 3_600_000);
+    for (const id of [contribId, cp, state.tree, blob]) {
+      await utimes(repo.objects.shardPath(id), past, past);
+    }
+
+    await repo.gc();
+    expect(await repo.objects.has(contribId)).toBe(true);
+    expect(await repo.objects.has(cp)).toBe(true);
+    expect((await repo.contribution(contribId))!.contribution.state).toBe(cp);
+  });
+
+  test("opening a repository cleans leftover meta temp files", async () => {
+    const repo = await init(root);
+    await repo.checkpoint({ message: "noop", author: AUTHOR, layer: "x" }).catch(() => {});
+    const metaDir = join(root, ".javelin", "meta");
+    await writeFile(join(metaDir, ".tmp-crash"), "junk");
+    await mkdir(join(metaDir, ".locks"), { recursive: true });
+    await writeFile(join(metaDir, ".locks", ".tmp-crash2"), "junk");
+
+    await openRepository(root);
+    for (const scanDir of [metaDir, join(metaDir, ".locks")]) {
+      const leftovers = (await readdir(scanDir)).filter((name) => name.startsWith(".tmp-"));
+      expect(leftovers).toEqual([]);
+    }
   });
 
   test("provenance and evidence are append-only references", async () => {

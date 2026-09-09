@@ -1,11 +1,23 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { MetaStore } from "./meta";
 
 let dir: string;
 let metaDir: string;
+const lockPath = () => join(metaDir, ".locks", "k.lock");
+
+function locker(store: MetaStore): { withLock: (key: string, fn: () => Promise<string>) => Promise<string> } {
+  return store as unknown as { withLock: (key: string, fn: () => Promise<string>) => Promise<string> };
+}
+
+async function until(check: () => Promise<boolean>): Promise<void> {
+  for (;;) {
+    if (await check()) return;
+    await Bun.sleep(5);
+  }
+}
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "jvl-meta-"));
@@ -57,14 +69,28 @@ describe("MetaStore", () => {
     expect(await store.get("layer/one")).toBeNull();
   });
 
-  test("list returns keys under a prefix, skipping lock and temp files", async () => {
+  test("list returns .lock keys and hides the .locks dir and temp files", async () => {
     const store = new MetaStore(metaDir);
     await store.create("layer/alpha", "1");
-    await store.create("layer/beta", "2");
+    await store.create("layer/notes.lock", "2");
     await store.create("world", "3");
-    await writeFile(join(metaDir, "layer", "gamma.lock"), "junk");
-    expect(await store.list("layer/")).toEqual(["layer/alpha", "layer/beta"]);
-    expect(await store.list()).toEqual(["layer/alpha", "layer/beta", "world"]);
+    await writeFile(join(metaDir, ".tmp-junk"), "x");
+    const keys = await store.list();
+    expect(keys).toContain("layer/alpha");
+    expect(keys).toContain("layer/notes.lock");
+    expect(keys).not.toContain(".tmp-junk");
+    expect(keys.every((key) => !key.startsWith(".locks"))).toBe(true);
+  });
+
+  test("a meta key named world.lock does not wedge the world lockfile", async () => {
+    const store = new MetaStore(metaDir, { lockTimeoutMs: 500 });
+    expect(await store.create("world.lock", "v")).toBe(true);
+    expect(await store.create("world", "w")).toBe(true);
+    expect(await store.get("world.lock")).toBe("v");
+    expect(await store.get("world")).toBe("w");
+    expect((await store.list()).sort()).toEqual(["world", "world.lock"]);
+    expect(await store.delete("world.lock")).toBe(true);
+    expect(await store.compareAndSwap("world", "w", "w2")).toEqual({ ok: true, current: "w2" });
   });
 
   test("rejects invalid keys", async () => {
@@ -75,7 +101,8 @@ describe("MetaStore", () => {
 
   test("a stale lock is stolen after the mtime threshold", async () => {
     const store = new MetaStore(metaDir);
-    const lockPath = join(metaDir, "k.lock");
+    const lockPath = join(metaDir, ".locks", "k.lock");
+    await mkdir(dirname(lockPath), { recursive: true });
     await writeFile(lockPath, "pid:crashed");
     const backdated = new Date(Date.now() - 11_000);
     await utimes(lockPath, backdated, backdated);
@@ -85,7 +112,9 @@ describe("MetaStore", () => {
 
   test("a fresh lock blocks until the timeout", async () => {
     const store = new MetaStore(metaDir, { lockTimeoutMs: 300 });
-    await writeFile(join(metaDir, "k.lock"), "pid:live");
+    const lockPath = join(metaDir, ".locks", "k.lock");
+    await mkdir(dirname(lockPath), { recursive: true });
+    await writeFile(lockPath, "pid:live");
     await expect(store.create("k", "v")).rejects.toThrow("meta lock timeout: k");
     expect(await store.get("k")).toBeNull();
   });
@@ -121,4 +150,76 @@ console.log(wins);
     expect(wins[0]! + wins[1]!).toBe(20);
     expect(await store.get("race")).toMatch(/^20:\d+$/);
   }, 30_000);
+
+  test("two racers CASing from the same expected: exactly one ok", async () => {
+    const s1 = new MetaStore(metaDir);
+    const s2 = new MetaStore(metaDir);
+    const [r1, r2] = await Promise.all([
+      s1.compareAndSwap("race", null, "one"),
+      s2.compareAndSwap("race", null, "two"),
+    ]);
+    expect([r1.ok, r2.ok].filter(Boolean)).toHaveLength(1);
+    const winner = r1.ok ? r1 : r2;
+    expect(await s1.get("race")).toBe(winner.current);
+  });
+
+  test("the original holder's late release does not delete the new holder's lock", async () => {
+    const storeA = new MetaStore(metaDir);
+    const storeB = new MetaStore(metaDir);
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const holdA = locker(storeA).withLock("k", async () => {
+      await gateA;
+      return "A";
+    });
+    await until(() => readFile(lockPath(), "utf8").then(() => true).catch(() => false));
+    const backdated = new Date(Date.now() - 11_000);
+    await utimes(lockPath(), backdated, backdated);
+
+    let releaseB!: () => void;
+    const gateB = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    const holdB = locker(storeB).withLock("k", async () => {
+      await gateB;
+      return "B";
+    });
+    await until(async () => {
+      const stats = await stat(lockPath()).catch(() => null);
+      return stats !== null && Date.now() - stats.mtimeMs < 2_000;
+    });
+
+    releaseA();
+    expect(await holdA).toBe("A");
+    expect(JSON.parse(await readFile(lockPath(), "utf8")).token).toBeString();
+
+    releaseB();
+    expect(await holdB).toBe("B");
+    await until(() => readFile(lockPath(), "utf8").then(() => false).catch(() => true));
+  });
+
+  test("a live slow holder is never stolen from; bodies never overlap", async () => {
+    let inside = 0;
+    let maxInside = 0;
+    const track = (fn: () => Promise<string>): Promise<string> => {
+      inside++;
+      maxInside = Math.max(maxInside, inside);
+      return fn().finally(() => {
+        inside--;
+      });
+    };
+    const storeA = new MetaStore(metaDir, { staleLockMs: 120 });
+    const storeB = new MetaStore(metaDir, { staleLockMs: 120, lockTimeoutMs: 5_000 });
+    const holdA = locker(storeA).withLock("k", () =>
+      track(async () => {
+        await Bun.sleep(400);
+        return "A";
+      }),
+    );
+    const holdB = locker(storeB).withLock("k", () => track(async () => "B"));
+    expect(await Promise.all([holdA, holdB])).toEqual(["A", "B"]);
+    expect(maxInside).toBe(1);
+  }, 15_000);
 });
