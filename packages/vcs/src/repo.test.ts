@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ObjectId } from "../../protocol/src/model";
 import { init, openRepository, Repository, type Author, type FileMap, type MergeConflict, type PublishResult } from "./repo";
+import { ObjectStore } from "./store";
 
 const AUTHOR: Author = { name: "agent", email: "agent@javelin.dev" };
 
@@ -405,6 +406,55 @@ describe("Repository v2", () => {
     const fsck = await repo.fsck();
     expect(fsck.ok).toBe(true);
     expect(fsck.unreachable).not.toContain(head!);
+  });
+
+  test("gc keeps content re-added by a checkpoint landing during the sweep", async () => {
+    const repo = await init(root);
+    await repo.layerNew("scratch");
+    await repo.layerSwitch("scratch");
+    await writeFile(join(root, "blob.bin"), "precious-content\n");
+    const cp = (await repo.checkpoint({ message: "scratch", author: AUTHOR })).stateId;
+    await repo.layerSwitch("world");
+    await repo.layerDiscard("scratch");
+    const scratchState = await repo.loadState(cp);
+    const scratchTree = await repo.loadTree(scratchState.tree);
+    const blobId = scratchTree.entries.find((entry) => entry.name === "blob.bin")!.id;
+    const past = new Date(Date.now() - 2 * 3_600_000);
+    for (const id of [cp, scratchState.tree, blobId]) {
+      await utimes(repo.objects.shardPath(id), past, past);
+    }
+
+    await forkAndCheckpoint(repo, "live", "live layer work");
+    await writeFile(join(root, "blob.bin"), "precious-content\n");
+
+    class GcRacyStore extends ObjectStore {
+      triggered = false;
+      constructor() {
+        super(join(root, ".javelin", "objects"));
+      }
+      override async mtime(id: ObjectId): Promise<number | null> {
+        if (id === blobId && !this.triggered) {
+          this.triggered = true;
+          const racer = await openRepository(root);
+          await racer.checkpoint({ message: "re-add blob", author: AUTHOR, layer: "live" });
+        }
+        return super.mtime(id);
+      }
+    }
+    (repo as { objects: ObjectStore }).objects = new GcRacyStore();
+
+    await repo.gc();
+    expect(await repo.objects.has(blobId)).toBe(true);
+
+    const liveHead = (await repo.layerGet("live"))!.head!;
+    const clone = await mkdtemp(join(tmpdir(), "jvl-clone-"));
+    clones.push(clone);
+    await repo.materialize(liveHead, clone);
+    expect(await readFile(join(clone, "blob.bin"), "utf8")).toBe("precious-content\n");
+
+    const fsck = await repo.fsck();
+    expect(fsck.ok).toBe(true);
+    expect(fsck.unreachable).not.toContain(liveHead);
   });
 
   test("provenance and evidence are append-only references", async () => {
