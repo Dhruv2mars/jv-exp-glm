@@ -17,6 +17,10 @@ export interface MetaStoreOptions {
   staleLockMs?: number;
 }
 
+function lockValue(token: string): string {
+  return JSON.stringify({ token, pid: process.pid });
+}
+
 /**
  * The only mutable state in a repository: world head, layer refs, contribution status.
  * Every write is an exact-string compare-and-swap under a cross-process O_EXCL lockfile
@@ -25,10 +29,6 @@ export interface MetaStoreOptions {
  * holder. A live holder heartbeats the lock mtime; a lock left by a crashed process is
  * stolen once its mtime ages past the stale threshold.
  */
-function lockValue(token: string): string {
-  return JSON.stringify({ token, pid: process.pid });
-}
-
 export class MetaStore {
   private readonly lockTimeoutMs: number;
   private readonly staleLockMs: number;
@@ -102,6 +102,29 @@ export class MetaStore {
     };
     await walk([]);
     return keys.filter((key) => key.startsWith(prefix));
+  }
+
+  /** Removes leftover temp files from interrupted atomic writes. */
+  async cleanTemp(): Promise<number> {
+    let removed = 0;
+    const walk = async (rel: string[]): Promise<void> => {
+      let entries: string[];
+      try {
+        entries = (await readdir(join(this.dir, ...rel), { withFileTypes: true })).map((e) => e.name);
+      } catch {
+        return;
+      }
+      for (const name of entries.sort()) {
+        const parts = [...rel, name];
+        if ((await stat(join(this.dir, ...parts))).isDirectory()) await walk(parts);
+        else if (name.startsWith(".tmp-")) {
+          await rm(join(this.dir, ...parts)).catch(() => {});
+          removed++;
+        }
+      }
+    };
+    await walk([]);
+    return removed;
   }
 
   private async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {

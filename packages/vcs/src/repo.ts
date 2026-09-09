@@ -134,7 +134,8 @@ export class Repository {
   protected constructor(
     readonly root: string,
     private readonly javelinDir: string,
-  ) {    this.objects = new ObjectStore(join(javelinDir, "objects"));
+  ) {
+    this.objects = new ObjectStore(join(javelinDir, "objects"));
     this.meta = new MetaStore(join(javelinDir, "meta"));
   }
 
@@ -142,7 +143,9 @@ export class Repository {
     const javelinDir = join(root, ".javelin");
     await mkdir(join(javelinDir, "objects"), { recursive: true });
     await mkdir(join(javelinDir, "meta"), { recursive: true });
-    return new Repository(root, javelinDir);
+    const repo = new Repository(root, javelinDir);
+    await repo.meta.cleanTemp();
+    return repo;
   }
 
   /**
@@ -803,12 +806,25 @@ export class Repository {
       else if (obj.kind === "tree") await markTree(id);
       else keep.add(id);
     }
-    for (const id of await this.objects.list()) {
-      if (keep.has(id)) continue;
-      const obj = await this.objects.read(id);
-      if (!obj) continue;
-      if (obj.kind === "provenance" && obj.states.some((s) => keep.has(s))) keep.add(id);
-      else if (obj.kind === "evidence" && keep.has(obj.state)) keep.add(id);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const id of await this.objects.list()) {
+        if (keep.has(id)) continue;
+        const obj = await this.objects.read(id);
+        if (!obj) continue;
+        if (obj.kind === "provenance" && obj.states.some((s) => keep.has(s))) {
+          keep.add(id);
+          changed = true;
+          for (const s of obj.states) {
+            if (!keep.has(s)) await markState(s);
+          }
+        } else if (obj.kind === "evidence" && keep.has(obj.state)) {
+          keep.add(id);
+          changed = true;
+          if (!keep.has(obj.state)) await markState(obj.state);
+        }
+      }
     }
     return keep;
   }

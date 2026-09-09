@@ -646,6 +646,7 @@ describe("Repository v2", () => {
     });
     await repo.layerNew("temp");
     await repo.layerSwitch("temp");
+    await writeFile(join(root, "two.txt"), "2\n");
     const cpB = (await repo.checkpoint({ message: "orphan state", author: AUTHOR })).stateId;
     await repo.layerSwitch("keep");
     await repo.layerDiscard("temp");
@@ -658,7 +659,7 @@ describe("Repository v2", () => {
     });
     const stateB = await repo.loadState(cpB);
     const treeB = await repo.loadTree(stateB.tree);
-    const blobB = treeB.entries.find((entry) => entry.name === "one.txt" || entry.name === "a.txt")!.id;
+    const blobB = treeB.entries.find((entry) => entry.name === "two.txt")!.id;
     const past = new Date(Date.now() - 2 * 3_600_000);
     for (const id of [cpB, stateB.tree, blobB]) {
       await utimes(repo.objects.shardPath(id), past, past);
@@ -668,7 +669,7 @@ describe("Repository v2", () => {
     expect(await repo.objects.has(cpB)).toBe(true);
     expect((await repo.provenanceFor(cpB)).map((hit) => hit.record.states)).toContainEqual([cpA, cpB]);
     const clone = await freshClone(repo, cpB);
-    expect(existsSync(join(clone, "one.txt"))).toBe(true);
+    expect(existsSync(join(clone, "two.txt"))).toBe(true);
   });
 
   test("gc keeps open contribution objects and their referenced states", async () => {
