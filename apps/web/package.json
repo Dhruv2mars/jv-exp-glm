@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "type": "module",
   "bin": { "javelin-web": "./src/main.ts" },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
   "dependencies": {
     "@javelin/protocol": "workspace:*",
     "@javelin/sdk": "workspace:*"
