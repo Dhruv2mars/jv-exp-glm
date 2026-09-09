@@ -2,7 +2,7 @@ import { beforeEach, afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ObjectId } from "../../protocol/src/model";
+import type { ObjectId } from "@javelin/protocol";
 import { init, type Repository } from "@javelin/vcs";
 import { provenanceFor, queryRuns, runGraph } from "@javelin/provenance";
 import { captureAgentRun, runChain, structuredMessage, type FileChanges } from "./capture";

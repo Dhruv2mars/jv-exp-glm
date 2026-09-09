@@ -28,7 +28,7 @@ async function git(cwd: string, args: string[]): Promise<string> {
   return out;
 }
 
-export async function seedGitRepo(dir: string): Promise<void> {
+async function seedGitRepo(dir: string): Promise<void> {
   mkdirSync(dir, { recursive: true });
   await git(dir, ["init", "-b", "main"]);
   await git(dir, ["config", "user.email", "ops@test"]);
@@ -41,38 +41,40 @@ export async function seedGitRepo(dir: string): Promise<void> {
   await git(dir, ["commit", "-m", "second commit"]);
 }
 
-export async function seedServerRepo(name: string): Promise<void> {
+async function seedServerRepo(name: string): Promise<void> {
   await client.createRepo({ name });
   const gitDir = join(work, `${name}-git`);
   await seedGitRepo(gitDir);
   const result = await importFromGit(gitDir, join(work, "server-root", name));
   expect(result.warnings).toEqual([]);
-  expect(result.commits).toBe(2);
+  expect(result.counts.states).toBe(2);
 }
 
 describe("backup/restore round trip", () => {
-  test("restore recreates refs, objects and log identical to the pre-backup state", async () => {
+  test("restore recreates heads, objects and log identical to the pre-backup state", async () => {
     await seedServerRepo("proj");
-    const baseUrl = `http://localhost:${server.port}`;
-    const refsBefore = (await new JavelinClient({ baseUrl }).listRefs("proj")).refs;
-    const head = refsBefore["refs/heads/main"]!;
-    const logBefore = await client.log("proj", head, 10);
+    const headsBefore = await client.getHeads("proj");
+    const worldBefore = headsBefore.world!;
+    const logBefore = await client.statesLog("proj", { start: worldBefore, limit: 10 });
+    const fetchedBefore = await client.batchFetch("proj", [worldBefore]);
+    expect(fetchedBefore.objects).toHaveLength(1);
 
     const { backupRoot } = await import("./backup");
     const { restoreRoot } = await import("./restore");
     const { archivePath } = await backupRoot(join(work, "server-root"), join(work, "archive"));
 
     rmSync(join(work, "server-root"), { recursive: true, force: true });
-    await expect(client.listRefs("proj")).rejects.toThrow();
+    await expect(client.getHeads("proj")).rejects.toThrow();
 
     const repos = await restoreRoot(archivePath, join(work, "server-root"));
     expect(repos).toEqual(["proj"]);
 
-    const refsAfter = (await client.listRefs("proj")).refs;
-    expect(refsAfter).toEqual(refsBefore);
-    const logAfter = await client.log("proj", head, 10);
-    expect(logAfter).toEqual(logBefore);
-    const objects = await client.fetchObjects("proj", [head]);
-    expect(objects.objects).toHaveLength(1);
+    const headsAfter = await client.getHeads("proj");
+    expect(headsAfter.world).toBe(worldBefore);
+    expect(headsAfter.layers).toEqual(headsBefore.layers);
+    const logAfter = await client.statesLog("proj", { start: worldBefore, limit: 10 });
+    expect(logAfter.entries).toEqual(logBefore.entries);
+    const fetchedAfter = await client.batchFetch("proj", [worldBefore]);
+    expect(fetchedAfter.objects).toEqual(fetchedBefore.objects);
   });
 });

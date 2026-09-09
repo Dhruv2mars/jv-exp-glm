@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ObjectId } from "../../protocol/src/model";
+import type { ObjectId } from "@javelin/protocol";
 import { Repository } from "@javelin/vcs";
 import { evaluatePublish, getPolicy, PolicyError, recordCheck, setPolicy } from "./index";
 

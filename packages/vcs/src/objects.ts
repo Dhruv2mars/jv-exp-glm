@@ -1,4 +1,4 @@
-import type { Contribution, EvidenceRecord, ObjectId, ProvenanceRecord, State, Tree, TreeEntry } from "../../protocol/src/model";
+import type { Contribution, EvidenceRecord, ObjectId, ProvenanceRecord, State, Tree, TreeEntry } from "@javelin/protocol";
 import { objectId } from "@javelin/protocol";
 
 const SHA256_ALGO = "SHA-256";

@@ -1,4 +1,4 @@
-import type { ObjectId, ProvenanceRecord } from "../../protocol/src/model";
+import type { ObjectId, ProvenanceRecord } from "@javelin/protocol";
 import type { Repository } from "@javelin/vcs";
 
 export interface ProvenanceEntry {

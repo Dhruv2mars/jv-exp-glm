@@ -20,18 +20,20 @@ Status after the semantics realignment (2026-09-09). Normative model: `docs/jave
 |---|---|---|
 | contracts | javelin-model.md, ADRs 0004-0009, protocol model.ts | merged |
 | community | MIT LICENSE, CONTRIBUTING, CoC, SECURITY, templates, changelog | merged |
-| vcs-core-v2 | states/trees/mode, layers/checkpoints, world head, contributions, diff3 merge + deletions, MetaStore CAS, GC reachability | in progress |
-| jrp-v2 | wire format, bounds, raw blob endpoints, pagination, spec doc | in progress |
-| javelind-v2 | head CAS via MetaStore seam, bounded/streaming endpoints, health/readiness, request IDs, structured logs | pending |
-| cli-v2 | layer/checkpoint/contribute/integrate/refresh/publish verbs | pending |
-| sdk-v2 | JRP v2 client | pending |
-| provenance-v2 | append-only records, remote ingestion API | pending |
-| bridge-v2 | git↔layers/world mapping, mirror modes, incremental sync | pending |
-| policy-v2 | publish-boundary policy, evidence binding to state+rules+env | pending |
-| search-v2 | async indexing over immutable history, derived views | pending |
-| web-v2 | world/layers/contributions views | pending |
-| e2e-v2 | end-to-end suite over the v2 model | pending |
+| vcs-core-v2 | states/trees/mode, layers/checkpoints, world head, contributions, diff3 merge + deletions, MetaStore CAS, GC reachability | merged |
+| jrp-v2 | wire format, bounds, raw blob endpoints, pagination, spec doc | merged |
+| javelind-v2 | head CAS via MetaStore seam, bounded/streaming endpoints, health/readiness, request IDs, structured logs | merged |
+| cli-v2 | layer/checkpoint/contribute/integrate/refresh/publish verbs | merged |
+| sdk-v2 | JRP v2 client | merged |
+| provenance-v2 | append-only records, remote ingestion API | merged |
+| bridge-v2 | git↔layers/world mapping, mirror modes, incremental sync | merged |
+| policy-v2 | publish-boundary policy, evidence binding to state+rules+env | merged |
+| search-v2 | async indexing over immutable history, derived views | merged |
+| web-v2 | world/layers/contributions views | merged |
+| e2e-v2 | end-to-end suite over the v2 model | merged |
 
 ## v1 archive
 
 The v1 slices (protocol contracts, vcs-core, javelind+JRP, CLI, git bridge, provenance, search, agent adapters, evidence/policy, SDK, web forge, ops) are all merged (PRs #1-#14). They remain useful implementation references; where they disagree with docs/javelin-model.md, the model wins and the v2 slices above supersede them.
+
+All v2 slices are merged. Core review follow-ups (lock token hardening, gc race fix, binary merge conflicts, adjacent-line merge) landed via PR #24. Next front: priority 4 (macOS `jv` binary + CI + release) and 5 (mirror authority modes made behavioral, remote-agent ingestion).

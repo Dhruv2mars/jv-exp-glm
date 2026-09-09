@@ -13,7 +13,7 @@ import type {
   ProvenanceRecord,
   State,
   Tree,
-} from "../../protocol/src/model";
+} from "@javelin/protocol";
 import { isObjectId, objectId } from "@javelin/protocol";
 import {
   decodeObject,

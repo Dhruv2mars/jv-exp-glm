@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import type { ObjectId } from "@javelin/protocol";
 import { openRepository, type FileEntry, type Repository } from "@javelin/vcs";
-import type { FileMode } from "../../protocol/src/model";
+import type { FileMode } from "@javelin/protocol";
 import { formatGitPerson, git } from "./git";
 import { writeMirrorMarker, type MirrorMode } from "./bridge";
 
