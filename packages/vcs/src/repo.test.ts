@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ObjectId } from "../../protocol/src/model";
@@ -634,6 +634,81 @@ describe("Repository v2", () => {
     await repo.gc();
     expect(await repo.objects.has(cp)).toBe(true);
     expect((await repo.layerGet("notes.lock"))!.head).toBe(cp);
+  });
+
+  test("gc keeps every state a kept provenance record references", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+    });
+    const cpA = await forkAndCheckpoint(repo, "keep", "kept layer", async () => {
+      await writeFile(join(root, "one.txt"), "1\n");
+    });
+    await repo.layerNew("temp");
+    await repo.layerSwitch("temp");
+    const cpB = (await repo.checkpoint({ message: "orphan state", author: AUTHOR })).stateId;
+    await repo.layerSwitch("keep");
+    await repo.layerDiscard("temp");
+
+    await repo.recordProvenance({
+      states: [cpA, cpB],
+      agent: { name: "agent", adapter: "generic" },
+      startedAt: new Date().toISOString(),
+      exit: "success",
+    });
+    const stateB = await repo.loadState(cpB);
+    const treeB = await repo.loadTree(stateB.tree);
+    const blobB = treeB.entries.find((entry) => entry.name === "one.txt" || entry.name === "a.txt")!.id;
+    const past = new Date(Date.now() - 2 * 3_600_000);
+    for (const id of [cpB, stateB.tree, blobB]) {
+      await utimes(repo.objects.shardPath(id), past, past);
+    }
+
+    await repo.gc();
+    expect(await repo.objects.has(cpB)).toBe(true);
+    expect((await repo.provenanceFor(cpB)).map((hit) => hit.record.states)).toContainEqual([cpA, cpB]);
+    const clone = await freshClone(repo, cpB);
+    expect(existsSync(join(clone, "one.txt"))).toBe(true);
+  });
+
+  test("gc keeps open contribution objects and their referenced states", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+    });
+    const cp = await forkAndCheckpoint(repo, "prop", "proposal", async () => {
+      await writeFile(join(root, "b.txt"), "b\n");
+    });
+    const contribId = await repo.contribute("prop", "propose b", AUTHOR);
+    await repo.layerDiscard("prop");
+
+    const state = await repo.loadState(cp);
+    const tree = await repo.loadTree(state.tree);
+    const blob = tree.entries.find((entry) => entry.name === "b.txt")!.id;
+    const past = new Date(Date.now() - 2 * 3_600_000);
+    for (const id of [contribId, cp, state.tree, blob]) {
+      await utimes(repo.objects.shardPath(id), past, past);
+    }
+
+    await repo.gc();
+    expect(await repo.objects.has(contribId)).toBe(true);
+    expect(await repo.objects.has(cp)).toBe(true);
+    expect((await repo.contribution(contribId))!.contribution.state).toBe(cp);
+  });
+
+  test("opening a repository cleans leftover meta temp files", async () => {
+    const repo = await init(root);
+    await repo.checkpoint({ message: "noop", author: AUTHOR, layer: "x" }).catch(() => {});
+    const metaDir = join(root, ".javelin", "meta");
+    await writeFile(join(metaDir, ".tmp-crash"), "junk");
+    await mkdir(join(metaDir, ".locks"), { recursive: true });
+    await writeFile(join(metaDir, ".locks", ".tmp-crash2"), "junk");
+
+    await openRepository(root);
+    for (const scanDir of [metaDir, join(metaDir, ".locks")]) {
+      const leftovers = (await readdir(scanDir)).filter((name) => name.startsWith(".tmp-"));
+      expect(leftovers).toEqual([]);
+    }
   });
 
   test("provenance and evidence are append-only references", async () => {
