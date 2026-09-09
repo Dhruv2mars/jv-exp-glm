@@ -1,44 +1,85 @@
 /**
  * Line-level three-way merge. base/ours/theirs are line arrays (split on "\n").
  * Returns the merged lines, or null when the same region changed on both sides.
+ * Each side is diffed against base into hunks; hunks that touch disjoint base
+ * lines merge, hunks that overlap (or both insert at one point) conflict.
  */
-export function diff3(base: string[], ours: string[], theirs: string[]): { lines: string[] | null } {
-  const mo = lcsMatches(base, ours);
-  const mt = lcsMatches(base, theirs);
-  const out: string[] = [];
-  let i = 0;
-  let j = 0;
-  let k = 0;
-  while (i < base.length) {
-    if (mo[i] === j && mt[i] === k) {
-      out.push(base[i]!);
-      i++;
-      j++;
-      k++;
+interface Hunk {
+  baseStart: number;
+  baseEnd: number;
+  sideStart: number;
+  sideEnd: number;
+}
+
+function edits(base: string[], side: string[], matches: number[]): Hunk[] {
+  const hunks: Hunk[] = [];
+  let b = 0;
+  let s = 0;
+  while (b < base.length) {
+    if (matches[b] === s) {
+      b++;
+      s++;
       continue;
     }
-    let i2 = i;
-    while (i2 < base.length && (mo[i2] === -1 || mt[i2] === -1)) i2++;
-    const oEnd = i2 < base.length ? mo[i2]! : ours.length;
-    const tEnd = i2 < base.length ? mt[i2]! : theirs.length;
-    const bChunk = base.slice(i, i2);
-    const oChunk = ours.slice(j, oEnd);
-    const tChunk = theirs.slice(k, tEnd);
-    if (linesEqual(oChunk, tChunk)) out.push(...oChunk);
-    else if (linesEqual(bChunk, oChunk)) out.push(...tChunk);
-    else if (linesEqual(bChunk, tChunk)) out.push(...oChunk);
-    else return { lines: null };
-    i = i2;
-    j = oEnd;
-    k = tEnd;
+    const baseStart = b;
+    const sideStart = s;
+    while (b < base.length && matches[b] !== s) {
+      if (matches[b] === -1) b++;
+      else if (matches[b]! > s) s = matches[b]!;
+      else break;
+    }
+    hunks.push({ baseStart, baseEnd: b, sideStart, sideEnd: s });
   }
-  if (j < ours.length || k < theirs.length) {
-    const oChunk = ours.slice(j);
-    const tChunk = theirs.slice(k);
-    if (linesEqual(oChunk, tChunk) || tChunk.length === 0) out.push(...oChunk);
-    else if (oChunk.length === 0) out.push(...tChunk);
-    else return { lines: null };
+  if (s < side.length) hunks.push({ baseStart: base.length, baseEnd: base.length, sideStart: s, sideEnd: side.length });
+  return hunks;
+}
+
+function hunksOverlap(a: Hunk, b: Hunk): boolean {
+  if (a.baseStart < a.baseEnd && b.baseStart < b.baseEnd) {
+    return a.baseStart < b.baseEnd && b.baseStart < a.baseEnd;
   }
+  const point = a.baseStart === a.baseEnd ? a.baseStart : b.baseStart;
+  const other = a.baseStart === a.baseEnd ? b : a;
+  return point >= other.baseStart && point <= other.baseEnd;
+}
+
+function pushRange(out: string[], lines: string[], start: number, end: number): void {
+  for (let i = start; i < end; i++) out.push(lines[i]!);
+}
+
+export function diff3(base: string[], ours: string[], theirs: string[]): { lines: string[] | null } {
+  const oursHunks = edits(base, ours, lcsMatches(base, ours));
+  const theirsHunks = edits(base, theirs, lcsMatches(base, theirs));
+  const out: string[] = [];
+  let b = 0;
+  let io = 0;
+  let it = 0;
+  while (io < oursHunks.length || it < theirsHunks.length) {
+    const takeOurs =
+      it >= theirsHunks.length || (io < oursHunks.length && oursHunks[io]!.baseStart <= theirsHunks[it]!.baseStart);
+    const hunk = takeOurs ? oursHunks[io]! : theirsHunks[it]!;
+    if (hunk.baseStart < b) return { lines: null };
+    if (hunk.baseStart > b) {
+      pushRange(out, base, b, hunk.baseStart);
+      b = hunk.baseStart;
+    }
+    const other = takeOurs ? theirsHunks[it] : oursHunks[io];
+    if (other && hunksOverlap(hunk, other)) {
+      const oursChunk = ours.slice(hunk.sideStart, hunk.sideEnd);
+      const theirsChunk = theirs.slice(other.sideStart, other.sideEnd);
+      if (!linesEqual(oursChunk, theirsChunk)) return { lines: null };
+      pushRange(out, ours, hunk.sideStart, hunk.sideEnd);
+      b = Math.max(hunk.baseEnd, other.baseEnd);
+      io++;
+      it++;
+      continue;
+    }
+    pushRange(out, takeOurs ? ours : theirs, hunk.sideStart, hunk.sideEnd);
+    b = hunk.baseEnd;
+    if (takeOurs) io++;
+    else it++;
+  }
+  pushRange(out, base, b, base.length);
   return { lines: out };
 }
 
