@@ -175,8 +175,7 @@ console.log(wins);
 
     releaseA();
     expect(await holdA).toBe("A");
-    const held = await readFile(lockPath(), "utf8");
-    expect(held).not.toContain(String(process.pid));
+    expect(JSON.parse(await readFile(lockPath(), "utf8")).token).toBeString();
 
     releaseB();
     expect(await holdB).toBe("B");

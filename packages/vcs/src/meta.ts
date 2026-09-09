@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
@@ -14,22 +14,31 @@ export interface CasResult {
 
 export interface MetaStoreOptions {
   lockTimeoutMs?: number;
+  staleLockMs?: number;
 }
 
 /**
  * The only mutable state in a repository: world head, layer refs, contribution status.
  * Every write is an exact-string compare-and-swap under a cross-process O_EXCL lockfile
- * (docs/adr/0006). A lock left by a crashed process is stolen once its mtime ages past
- * STALE_LOCK_MS.
+ * (docs/adr/0006). The lock carries a random owner token: release deletes the file only
+ * when the token still matches, so a stolen lock is never unlinked by its previous
+ * holder. A live holder heartbeats the lock mtime; a lock left by a crashed process is
+ * stolen once its mtime ages past the stale threshold.
  */
+function lockValue(token: string): string {
+  return JSON.stringify({ token, pid: process.pid });
+}
+
 export class MetaStore {
   private readonly lockTimeoutMs: number;
+  private readonly staleLockMs: number;
 
   constructor(
     readonly dir: string,
     options: MetaStoreOptions = {},
   ) {
     this.lockTimeoutMs = options.lockTimeoutMs ?? LOCK_TIMEOUT_MS;
+    this.staleLockMs = options.staleLockMs ?? STALE_LOCK_MS;
   }
 
   private filePath(key: string): string {
@@ -94,10 +103,11 @@ export class MetaStore {
   private async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const lockPath = this.filePath(key) + ".lock";
     await mkdir(dirname(lockPath), { recursive: true });
+    const token = crypto.randomUUID();
     const deadline = Date.now() + this.lockTimeoutMs;
     for (;;) {
       try {
-        await writeFile(lockPath, `pid:${process.pid}`, { flag: "wx" });
+        await writeFile(lockPath, lockValue(token), { flag: "wx" });
         break;
       } catch (err) {
         if ((err as { code?: string }).code !== "EEXIST") throw err;
@@ -107,15 +117,31 @@ export class MetaStore {
         } catch {
           continue;
         }
-        if (age > STALE_LOCK_MS) await rm(lockPath).catch(() => {});
+        if (age > this.staleLockMs) {
+          const stolen = `${lockPath}.${token}.stolen`;
+          try {
+            await rename(lockPath, stolen);
+            await rm(stolen).catch(() => {});
+          } catch {
+            // another process moved it first; retry the acquire
+          }
+          continue;
+        }
         if (Date.now() > deadline) throw new Error(`meta lock timeout: ${key}`);
         await Bun.sleep(RETRY_MS);
       }
     }
+    const heartbeat = setInterval(() => {
+      const now = new Date();
+      void utimes(lockPath, now, now).catch(() => {});
+    }, Math.max(this.staleLockMs / 3, 5));
+    heartbeat.unref?.();
     try {
       return await fn();
     } finally {
-      await rm(lockPath).catch(() => {});
+      clearInterval(heartbeat);
+      const current = await readFile(lockPath, "utf8").catch(() => null);
+      if (current === lockValue(token)) await rm(lockPath).catch(() => {});
     }
   }
   private async atomicWrite(path: string, contents: string): Promise<void> {
