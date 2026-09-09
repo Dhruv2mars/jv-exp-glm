@@ -6,6 +6,8 @@ import { join } from "node:path";
 import type { ObjectId } from "../../protocol/src/model";
 import { init, openRepository, Repository, type Author, type ContributionMeta, type FileMap, type MergeConflict, type PublishResult } from "./repo";
 import { ObjectStore } from "./store";
+import { MetaStore } from "./meta";
+import type { CasResult } from "./meta";
 
 const AUTHOR: Author = { name: "agent", email: "agent@javelin.dev" };
 
@@ -69,6 +71,45 @@ describe("Repository v2", () => {
     const reopened = await openRepository(root);
     expect(await reopened.worldHead()).toBe(head);
     expect(await repo.currentLayer()).toBe("world");
+  });
+
+  test("concurrent inits converge on a single init state and one world write", async () => {
+    const objectProto = ObjectStore.prototype as unknown as {
+      write: (obj: { kind: string; parents?: ObjectId[] }) => Promise<{ id: ObjectId; written: boolean }>;
+    };
+    const metaProto = MetaStore.prototype as unknown as {
+      compareAndSwap: (key: string, expected: string | null, next: string) => Promise<CasResult>;
+    };
+    const origWrite = objectProto.write;
+    const origCas = metaProto.compareAndSwap;
+    const worldWrites: ObjectId[] = [];
+    let stalled = false;
+    try {
+      objectProto.write = async function (obj) {
+        if (obj.kind === "state" && obj.parents?.length === 0 && !stalled) {
+          stalled = true;
+          await Bun.sleep(50);
+        }
+        return origWrite.call(this, obj);
+      };
+      metaProto.compareAndSwap = async function (key, expected, next) {
+        const result = await origCas.call(this, key, expected, next);
+        if (key === "world" && result.ok && expected !== null) {
+          worldWrites.push((JSON.parse(next) as { value: ObjectId }).value);
+        }
+        return result;
+      };
+
+      const [a, b] = await Promise.all([init(root), init(root)]);
+      const headA = await a.worldHead();
+      expect(headA).not.toBeNull();
+      expect(await b.worldHead()).toBe(headA);
+      expect(await a.worldLog(10)).toHaveLength(1);
+      expect(worldWrites).toHaveLength(1);
+    } finally {
+      objectProto.write = origWrite;
+      metaProto.compareAndSwap = origCas;
+    }
   });
 
   test("lifecycle: layer, checkpoint, contribute, publish, clone-like materialize", async () => {
