@@ -1,185 +1,460 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { openRepository } from "./index";
-import { Repository } from "./repo";
+import { join } from "node:path";
+import type { ObjectId } from "../../protocol/src/model";
+import { init, openRepository, Repository, type Author, type PublishResult } from "./repo";
+
+const AUTHOR: Author = { name: "agent", email: "agent@javelin.dev" };
 
 let root: string;
+let root2: string;
+let clones: string[];
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "jvl-repo-"));
+  clones = [];
 });
 afterEach(async () => {
   await rm(root, { recursive: true, force: true });
+  if (root2) await rm(root2, { recursive: true, force: true });
+  for (const clone of clones) await rm(clone, { recursive: true, force: true });
 });
 
-const enc = (s: string) => new TextEncoder().encode(s);
-const dec = (b: Uint8Array) => new TextDecoder().decode(b);
-
-async function commitFile(repo: Repository, path: string, content: string, message: string) {
-  await mkdir(dirname(join(root, path)), { recursive: true });
-  await writeFile(join(root, path), content);
-  await repo.stage(path, enc(content));
-  return repo.commit({ message });
+/** Move world forward by publishing a scratch layer whose edit runs against the current world head. */
+async function publishEdit(
+  repo: Repository,
+  layerName: string,
+  message: string,
+  edit: () => Promise<void>,
+): Promise<ObjectId> {
+  await repo.layerNew(layerName);
+  await repo.layerSwitch(layerName);
+  await edit();
+  await repo.checkpoint({ message, author: AUTHOR });
+  const id = await repo.contribute(layerName, message, AUTHOR);
+  const result = await repo.publish(id, AUTHOR);
+  if (!result.ok) throw new Error(`setup publish failed: ${result.reason}`);
+  return result.worldState!;
 }
 
-describe("repository basics", () => {
-  test("openRepository creates .javelin layout", async () => {
-    const repo = await openRepository(root);
-    expect(repo.refs.dir).toContain(join(".javelin", "refs"));
-    expect(repo.objects.dir).toContain(join(".javelin", "objects"));
+async function forkAndCheckpoint(
+  repo: Repository,
+  layerName: string,
+  message: string,
+  edit?: () => Promise<void>,
+): Promise<ObjectId> {
+  await repo.layerNew(layerName);
+  await repo.layerSwitch(layerName);
+  await edit?.();
+  return (await repo.checkpoint({ message, author: AUTHOR })).stateId;
+}
+
+async function freshClone(repo: Repository, stateId: ObjectId): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "jvl-clone-"));
+  clones.push(dir);
+  await repo.materialize(stateId, dir);
+  return dir;
+}
+
+describe("Repository v2", () => {
+  test("init creates a world head and is idempotent", async () => {
+    const repo = await init(root);
+    const head = await repo.worldHead();
+    expect(head).not.toBeNull();
+    const again = await init(root);
+    expect(await again.worldHead()).toBe(head);
+    const reopened = await openRepository(root);
+    expect(await reopened.worldHead()).toBe(head);
+    expect(await repo.currentLayer()).toBe("world");
   });
 
-  test("commit, log, checkout", async () => {
-    const repo = await openRepository(root);
-    const c1 = await commitFile(repo, "a.txt", "one", "first");
-    const c2 = await commitFile(repo, "dir/b.txt", "two", "second");
-    expect(c2).not.toBe(c1);
-    const log = await repo.log("refs/heads/main");
-    expect(log.map((e) => e.commit.message)).toEqual(["second", "first"]);
-    expect(log[0]!.commit.parents).toEqual([c1]);
+  test("lifecycle: layer, checkpoint, contribute, publish, clone-like materialize", async () => {
+    const repo = await init(root);
+    const base = await repo.worldHead();
+    const layer = await repo.layerNew("agent-a");
+    expect(layer.base).toBe(base!);
+    expect(layer.head).toBeNull();
+    await repo.layerSwitch("agent-a");
+    await writeFile(join(root, "hello.txt"), "hello world\n");
+    await writeFile(join(root, "run.sh"), "#!/bin/sh\necho hi\n");
+    await chmod(join(root, "run.sh"), 0o755);
+    await symlink("hello.txt", join(root, "link.txt"));
+    const cp = await repo.checkpoint({ message: "greet", author: AUTHOR });
+    expect(cp.layer).toBe("agent-a");
+    expect((await repo.layerGet("agent-a"))!.head).toBe(cp.stateId);
 
-    await writeFile(join(root, "a.txt"), "mutated");
-    await repo.checkout(c1);
-    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("one");
-    await repo.checkout("main");
-    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("one");
-    expect(await readFile(join(root, "dir/b.txt"), "utf8")).toBe("two");
-  });
+    const contribId = await repo.contribute("agent-a", "greet the world", AUTHOR);
+    const pub = await repo.publish(contribId, AUTHOR);
+    expect(pub.ok).toBe(true);
+    const world = await repo.worldHead();
+    expect(pub.worldState).toBe(world);
 
-  test("readTree returns flat path map", async () => {
-    const repo = await openRepository(root);
-    await commitFile(repo, "src/x.ts", "x", "add x");
-    await commitFile(repo, "src/sub/y.ts", "y", "add y");
-    const head = await repo.resolveToCommit("main");
-    const commit = await repo.loadCommit(head);
-    const files = await repo.readTree("src", commit.tree);
-    expect(Object.keys(files).sort()).toEqual(["src/sub/y.ts", "src/x.ts"]);
-  });
-
-  test("diff between commits", async () => {
-    const repo = await openRepository(root);
-    await commitFile(repo, "a.txt", "v1", "one");
-    await commitFile(repo, "a.txt", "v2", "two");
-    await commitFile(repo, "new.txt", "n", "three");
-    const log = await repo.log("main", 3);
-    const oldBlob = (await repo.readCommitTree(log[2]!.id))["a.txt"]!;
-    const entries = await repo.diff(log[2]!.id, log[0]!.id);
-    expect(entries).toEqual([
-      { path: "a.txt", status: "modified", oldId: oldBlob, newId: expect.any(String) },
-      { path: "new.txt", status: "added", oldId: null, newId: expect.any(String) },
+    const log = await repo.worldLog(10);
+    expect(log.map((entry) => entry.state.message)).toEqual([
+      "publish agent-a: greet the world",
+      "greet",
+      "init",
     ]);
+
+    const clone = await freshClone(repo, world!);
+    expect(await readFile(join(clone, "hello.txt"), "utf8")).toBe("hello world\n");
+    expect(((await stat(join(clone, "run.sh"))).mode & 0o111) !== 0).toBe(true);
+    expect(await readlink(join(clone, "link.txt"))).toBe("hello.txt");
+
+    const stored = await repo.contribution(contribId);
+    expect(stored!.meta.status).toBe("published");
+    expect(stored!.meta.events.at(-1)!.worldState).toBe(world!);
+    expect(stored!.contribution.state).toBe(cp.stateId);
+    expect(stored!.contribution.base).toBe(base!);
   });
 
-  test("branches create/list/delete", async () => {
-    const repo = await openRepository(root);
-    await commitFile(repo, "a.txt", "1", "first");
-    const create = await repo.createBranch("feature");
-    expect(create.ok).toBe(true);
-    const branches = await repo.listBranches().then((bs) => bs.map((b) => b.name).sort());
-    expect(branches).toEqual(["feature", "main"]);
-    await repo.setHeadBranch("feature");
-    const del = await repo.deleteBranch("feature");
-    expect(del.ok).toBe(false);
-    await repo.setHeadBranch("main");
-    expect((await repo.deleteBranch("feature")).ok).toBe(true);
+  test("materialize applies deletions of files absent in the target state", async () => {
+    const repo = await init(root);
+    await repo.layerNew("w");
+    await repo.layerSwitch("w");
+    await writeFile(join(root, "keep.txt"), "keep\n");
+    await writeFile(join(root, "drop.txt"), "drop\n");
+    const first = await repo.checkpoint({ message: "two files", author: AUTHOR });
+    await rm(join(root, "drop.txt"));
+    const second = await repo.checkpoint({ message: "one file", author: AUTHOR });
+
+    await repo.materialize(first.stateId);
+    expect(existsSync(join(root, "drop.txt"))).toBe(true);
+    await repo.materialize(second.stateId);
+    expect(existsSync(join(root, "drop.txt"))).toBe(false);
+    expect(await readFile(join(root, "keep.txt"), "utf8")).toBe("keep\n");
   });
 
-  test("ref CAS rejects stale update", async () => {
-    const repo = await openRepository(root);
-    const c1 = await commitFile(repo, "a.txt", "1", "first");
-    const c2 = await commitFile(repo, "a.txt", "2", "second");
-    const result = await repo.refs.set("refs/heads/main", c1, c1);
-    expect(result.ok).toBe(false);
-    expect(result.reason).toBe("cas-mismatch");
+  test("scanWorkingDir captures nested paths, exec bit, and symlinks", async () => {
+    const repo = await init(root);
+    await repo.layerNew("modes");
+    await repo.layerSwitch("modes");
+    await mkdir(join(root, "src", "deep"), { recursive: true });
+    await writeFile(join(root, "src", "deep", "main.ts"), "export {};\n");
+    await writeFile(join(root, "src", "tool.sh"), "#!/bin/sh\n");
+    await chmod(join(root, "src", "tool.sh"), 0o755);
+    await symlink("../tool.sh", join(root, "src", "alias"));
+    const cp = await repo.checkpoint({ message: "modes", author: AUTHOR });
+    const clone = await freshClone(repo, cp.stateId);
+    expect(await readFile(join(clone, "src", "deep", "main.ts"), "utf8")).toBe("export {};\n");
+    expect(((await stat(join(clone, "src", "tool.sh"))).mode & 0o111) !== 0).toBe(true);
+    expect(await readlink(join(clone, "src", "alias"))).toBe("../tool.sh");
   });
-});
 
-describe("merge", () => {
-  test("clean three-way merge commits with two parents", async () => {
-    const repo = await openRepository(root);
-    await commitFile(repo, "base.txt", "base", "base");
-    await repo.createBranch("side");
-    await commitFile(repo, "ours.txt", "ours", "ours change");
-    await repo.setHeadBranch("side");
-    await repo.checkout("side");
-    await commitFile(repo, "theirs.txt", "theirs", "their change");
-    await repo.setHeadBranch("main");
-    await repo.checkout("main");
+  test("refresh merges different-line edits of the same file without conflict", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "file.txt"), "one\ntwo\nthree\nfour\nfive\n");
+    });
+    await forkAndCheckpoint(repo, "work", "edit first line", async () => {
+      await writeFile(join(root, "file.txt"), "ONE\ntwo\nthree\nfour\nfive\n");
+    });
+    await publishEdit(repo, "worldside", "edit last line", async () => {
+      await writeFile(join(root, "file.txt"), "one\ntwo\nthree\nfour\nFIVE\n");
+    });
 
-    const result = await repo.mergeBranch("side");
+    const result = await repo.refresh("work");
     expect(result.ok).toBe(true);
-    expect(result.conflicts).toEqual([]);
-    const head = await repo.loadCommit(await repo.resolveToCommit("main"));
-    expect(head.parents).toHaveLength(2);
-    expect(dec(await repo.readBlob((await repo.readCommitTree(head.parents[1]!))["theirs.txt"]!))).toBe("theirs");
-    expect(await readFile(join(root, "ours.txt"), "utf8")).toBe("ours");
-    expect((await repo.log("main")).length).toBe(4);
+    expect(await readFile(join(root, "file.txt"), "utf8")).toBe("ONE\ntwo\nthree\nfour\nFIVE\n");
+    const log = await repo.layerLog("work");
+    const world = await repo.worldHead();
+    expect(log[0]!.state.parents).toContain(world!);
   });
 
-  test("conflicting edit reports structured conflict and leaves main untouched", async () => {
-    const repo = await openRepository(root);
-    await commitFile(repo, "f.txt", "base", "base");
-    await repo.createBranch("side");
-    await commitFile(repo, "f.txt", "ours", "ours edit");
-    await repo.setHeadBranch("side");
-    await repo.checkout("side");
-    await commitFile(repo, "f.txt", "theirs", "their edit");
-    await repo.setHeadBranch("main");
-    await repo.checkout("main");
+  test("refresh reports a conflict on competing same-line edits and changes nothing", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "file.txt"), "x\ny\n");
+    });
+    const cp = await forkAndCheckpoint(repo, "work", "ours", async () => {
+      await writeFile(join(root, "file.txt"), "X\ny\n");
+    });
+    await publishEdit(repo, "worldside", "theirs", async () => {
+      await writeFile(join(root, "file.txt"), "Z\ny\n");
+    });
+    const worldBefore = await repo.worldHead();
 
-    const result = await repo.mergeBranch("side");
+    const result = await repo.refresh("work");
     expect(result.ok).toBe(false);
-    expect(result.commitId).toBeNull();
-    expect(result.conflicts).toEqual([
-      { path: "f.txt", baseId: expect.any(String), oursId: expect.any(String), theirsId: expect.any(String) },
-    ]);
-    expect(await readFile(join(root, "f.txt"), "utf8")).toBe("ours");
-    const head = await repo.loadCommit(await repo.resolveToCommit("main"));
-    expect(head.parents).toHaveLength(1);
+    expect(result.conflicts).toHaveLength(1);
+    expect(result.conflicts[0]!.path).toBe("file.txt");
+    expect(result.conflicts[0]!.kind).toBe("content");
+    expect(result.conflicts[0]!.baseId).not.toBeNull();
+    expect(result.conflicts[0]!.oursId).not.toBe(result.conflicts[0]!.theirsId);
+    expect((await repo.layerGet("work"))!.head).toBe(cp);
+    expect(await repo.worldHead()).toBe(worldBefore);
+    expect(await repo.layerLog("work")).toHaveLength(1);
   });
 
-  test("non-overlapping edits to same directory merge cleanly", async () => {
-    const repo = await openRepository(root);
-    await commitFile(repo, "pkg/a", "a", "base");
-    await repo.createBranch("side");
-    await commitFile(repo, "pkg/b", "b", "ours");
-    await repo.setHeadBranch("side");
-    await repo.checkout("side");
-    await commitFile(repo, "pkg/c", "c", "theirs");
-    await repo.setHeadBranch("main");
-    await repo.checkout("main");
-    const result = await repo.mergeBranch("side");
+  test("a file added to world after the fork appears in the layer after refresh", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "base.txt"), "base\n");
+    });
+    await forkAndCheckpoint(repo, "fork", "layer work", async () => {
+      await writeFile(join(root, "mine.txt"), "mine\n");
+    });
+    await publishEdit(repo, "adder", "world adds a file", async () => {
+      await writeFile(join(root, "worlds.txt"), "from world\n");
+    });
+
+    const result = await repo.refresh("fork");
     expect(result.ok).toBe(true);
-    const files = Object.keys(await repo.readCommitTree(await repo.resolveToCommit("main"))).sort();
-    expect(files).toEqual(["pkg/a", "pkg/b", "pkg/c"]);
+    expect(await readFile(join(root, "worlds.txt"), "utf8")).toBe("from world\n");
+    expect(await readFile(join(root, "mine.txt"), "utf8")).toBe("mine\n");
+    expect(await readFile(join(root, "base.txt"), "utf8")).toBe("base\n");
   });
-});
 
-describe("fsck", () => {
-  test("passes on real history", async () => {
-    const repo = await openRepository(root);
-    await commitFile(repo, "a.txt", "1", "first");
-    await repo.createBranch("side");
-    await commitFile(repo, "b.txt", "2", "second");
-    await repo.setHeadBranch("side");
-    await commitFile(repo, "c.txt", "3", "third");
-    await repo.setHeadBranch("main");
-    await repo.mergeBranch("side");
-    const result = await repo.fsck();
-    expect(result.issues).toEqual([]);
+  test("deletion semantics: theirs deleted and ours unmodified deletes the file", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+      await writeFile(join(root, "b.txt"), "b\n");
+    });
+    await forkAndCheckpoint(repo, "d1", "no changes");
+    await publishEdit(repo, "worldside", "delete b", async () => {
+      await rm(join(root, "b.txt"));
+    });
+
+    const result = await repo.refresh("d1");
     expect(result.ok).toBe(true);
-    expect(result.objects).toBeGreaterThan(5);
+    expect(existsSync(join(root, "b.txt"))).toBe(false);
+    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("a\n");
   });
 
-  test("detects corrupt object content", async () => {
-    const repo = await openRepository(root);
-    await commitFile(repo, "a.txt", "1", "first");
-    const treeId = (await repo.loadCommit(await repo.resolveToCommit("main"))).tree;
-    await writeFile(join(repo.objects.dir, treeId.slice(0, 2), treeId.slice(2)), "\x02not-json");
-    const result = await repo.fsck();
+  test("deletion semantics: ours deleted and theirs unmodified stays deleted", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+      await writeFile(join(root, "b.txt"), "b\n");
+    });
+    await forkAndCheckpoint(repo, "d2", "delete b locally", async () => {
+      await rm(join(root, "b.txt"));
+    });
+    const worldBefore = await repo.worldHead();
+
+    const result = await repo.refresh("d2");
+    expect(result.ok).toBe(true);
+    expect(existsSync(join(root, "b.txt"))).toBe(false);
+    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("a\n");
+    expect(await repo.worldHead()).toBe(worldBefore);
+  });
+
+  test("deletion semantics: both deleted deletes, delete plus modify conflicts", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+      await writeFile(join(root, "b.txt"), "b\n");
+    });
+    await forkAndCheckpoint(repo, "d3", "delete b", async () => {
+      await rm(join(root, "b.txt"));
+    });
+    await publishEdit(repo, "worldside", "also delete b", async () => {
+      await rm(join(root, "b.txt"));
+    });
+    const result = await repo.refresh("d3");
+    expect(result.ok).toBe(true);
+    expect(existsSync(join(root, "b.txt"))).toBe(false);
+
+    root2 = await mkdtemp(join(tmpdir(), "jvl-repo-"));
+    const second = await init(root2);
+    await publishEdit(second, "seed2", "seed with b", async () => {
+      await writeFile(join(root2, "a.txt"), "a\n");
+      await writeFile(join(root2, "b.txt"), "b\n");
+    });
+    const cp = await forkAndCheckpoint(second, "dm", "keep both");
+    await second.layerSwitch("dm");
+    await rm(join(root2, "b.txt"));
+    await second.checkpoint({ message: "delete b", author: AUTHOR });
+    await publishEdit(second, "worldside2", "modify b", async () => {
+      await writeFile(join(root2, "b.txt"), "modified\n");
+    });
+    const conflicted = await second.refresh("dm");
+    expect(conflicted.ok).toBe(false);
+    expect(conflicted.conflicts).toHaveLength(1);
+    expect(conflicted.conflicts[0]!.kind).toBe("delete-modify");
+    expect(conflicted.conflicts[0]!.path).toBe("b.txt");
+    expect((await second.layerGet("dm"))!.head).not.toBe(cp);
+  });
+
+  test("publish conflict leaves world untouched and the contribution open", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "file.txt"), "x\ny\n");
+    });
+    await repo.layerNew("p");
+    await repo.layerSwitch("p");
+    await writeFile(join(root, "file.txt"), "X\ny\n");
+    await repo.checkpoint({ message: "ours", author: AUTHOR });
+    const contribId = await repo.contribute("p", "change x", AUTHOR);
+    await publishEdit(repo, "worldside", "competing change", async () => {
+      await writeFile(join(root, "file.txt"), "Z\ny\n");
+    });
+    const worldBefore = await repo.worldHead();
+
+    const result = await repo.publish(contribId, AUTHOR);
     expect(result.ok).toBe(false);
-    expect(result.issues.some((i) => i.id === treeId)).toBe(true);
+    expect(result.reason).toBe("conflict");
+    expect(result.conflicts.map((c) => c.path)).toEqual(["file.txt"]);
+    expect(await repo.worldHead()).toBe(worldBefore);
+    expect((await repo.contribution(contribId))!.meta.status).toBe("open");
+  });
+
+  test("publishing twice is a no-op idempotent success", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "file.txt"), "x\n");
+    });
+    await forkAndCheckpoint(repo, "i1", "add file", async () => {
+      await writeFile(join(root, "added.txt"), "added\n");
+    });
+    const contribId = await repo.contribute("i1", "add a file", AUTHOR);
+    const first = await repo.publish(contribId, AUTHOR);
+    expect(first.ok).toBe(true);
+    const world = await repo.worldHead();
+    expect(first.worldState).toBe(world);
+
+    const second = await repo.publish(contribId, AUTHOR);
+    expect(second.ok).toBe(true);
+    expect(second.idempotent).toBe(true);
+    expect(await repo.worldHead()).toBe(world);
+  });
+
+  test("publish reports world-moved when the head advanced before the CAS and changes nothing", async () => {
+    const repo = await init(root);
+    await forkAndCheckpoint(repo, "slow", "work", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+    });
+    const contribId = await repo.contribute("slow", "propose", AUTHOR);
+    const worldBefore = await repo.worldHead();
+
+    class RacyRepo extends Repository {
+      raced = false;
+      constructor(rootPath: string, javelinDir: string) {
+        super(rootPath, javelinDir);
+      }
+      protected override async casWorld(expectedRaw: string, next: ObjectId): Promise<boolean> {
+        if (!this.raced) {
+          this.raced = true;
+          const initTree = await this.loadState(worldBefore!);
+          const racer = {
+            kind: "state" as const,
+            tree: initTree.tree,
+            parents: [worldBefore!],
+            author: { name: "racer", email: "racer@x", time: new Date().toISOString() },
+            message: "racer publish",
+          };
+          const { id } = await this.objects.write(racer);
+          await this.meta.compareAndSwap("world", expectedRaw, JSON.stringify({ value: id }));
+        }
+        return super.casWorld(expectedRaw, next);
+      }
+    }
+    const racy = new RacyRepo(root, join(root, ".javelin"));
+    const result: PublishResult = await racy.publish(contribId, AUTHOR);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("world-moved");
+    expect(await repo.worldHead()).not.toBe(worldBefore);
+    expect((await repo.contribution(contribId))!.meta.status).toBe("open");
+  });
+
+  test("provenance and evidence are append-only references", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+    });
+    const cp = await forkAndCheckpoint(repo, "prov", "work", async () => {
+      await writeFile(join(root, "b.txt"), "b\n");
+    });
+    const headBefore = (await repo.layerGet("prov"))!.head;
+
+    const provId = await repo.recordProvenance({
+      states: [cp],
+      agent: { name: "agent", adapter: "generic" },
+      startedAt: new Date().toISOString(),
+      exit: "success",
+    });
+    expect((await repo.layerGet("prov"))!.head).toBe(headBefore);
+    const provs = await repo.provenanceFor(cp);
+    expect(provs.map((hit) => hit.id)).toContain(provId);
+    expect(provs[0]!.record.states).toEqual([cp]);
+
+    const evId = await repo.recordEvidence({
+      state: cp,
+      rules: "ci@rev1",
+      checks: [{ check: "build", status: "pass" }],
+      at: new Date().toISOString(),
+    });
+    const evidence = await repo.evidenceFor(cp);
+    expect(evidence.map((hit) => hit.id)).toContain(evId);
+    expect(evidence[0]!.record.rules).toBe("ci@rev1");
+    expect(await repo.provenanceFor((await repo.worldHead())!)).toEqual([]);
+  });
+
+  test("switching from a layer with extra files to world removes them", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "base.txt"), "base\n");
+    });
+    await forkAndCheckpoint(repo, "extra", "add extra", async () => {
+      await writeFile(join(root, "extra.txt"), "extra\n");
+    });
+    expect(existsSync(join(root, "extra.txt"))).toBe(true);
+
+    await repo.layerSwitch("world");
+    expect(existsSync(join(root, "extra.txt"))).toBe(false);
+    expect(await readFile(join(root, "base.txt"), "utf8")).toBe("base\n");
+    expect(await repo.currentLayer()).toBe("world");
+  });
+
+  test("layerDiscard deletes metadata and objects become unreachable", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+    });
+    const cp = await forkAndCheckpoint(repo, "temp", "scratch", async () => {
+      await writeFile(join(root, "scratch.txt"), "scratch\n");
+    });
+    await repo.layerDiscard("temp");
+    expect(await repo.layerGet("temp")).toBeNull();
+    expect((await repo.layerList()).map((ref) => ref.name)).toEqual(["seed"]);
+    expect((await repo.fsck()).unreachable).toContain(cp);
+    await expect(repo.layerDiscard("temp")).rejects.toThrow("no such layer");
+  });
+
+  test("gc keeps reachable objects, removes an unreachable state, fsck clean after", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "a.txt"), "a\n");
+    });
+    const cp = await forkAndCheckpoint(repo, "temp", "scratch", async () => {
+      await writeFile(join(root, "scratch.txt"), "scratch\n");
+    });
+    const state = await repo.loadState(cp);
+    const tree = await repo.loadTree(state.tree);
+    const scratchBlob = tree.entries.find((entry) => entry.name === "scratch.txt")!.id;
+
+    expect((await repo.gc()).removed).toBe(0);
+
+    await repo.layerDiscard("temp");
+    const past = new Date(Date.now() - 2 * 3_600_000);
+    for (const id of [cp, state.tree, scratchBlob]) {
+      await utimes(repo.objects.shardPath(id), past, past);
+    }
+
+    const gc = await repo.gc();
+    expect(gc.removed).toBe(3);
+    expect(await repo.objects.has(cp)).toBe(false);
+
+    const world = await repo.worldHead();
+    const clone = await freshClone(repo, world!);
+    expect(await readFile(join(clone, "a.txt"), "utf8")).toBe("a\n");
+
+    const fsck = await repo.fsck();
+    expect(fsck.ok).toBe(true);
+    expect(fsck.issues).toEqual([]);
+    expect(fsck.unreachable).toEqual([]);
   });
 });

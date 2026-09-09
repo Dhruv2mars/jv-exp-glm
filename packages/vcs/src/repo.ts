@@ -1,114 +1,81 @@
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readlink, readdir, readFile, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Commit, ObjectId, RefName, RefUpdateResult, Tree } from "@javelin/protocol";
-import { isObjectId } from "@javelin/protocol";
-import { makeTree, sortTreeEntries, encodeObject, hashEncoding, type BlobObject, type StoredObject } from "./objects";
+import type {
+  Contribution,
+  ContributionEvent,
+  ContributionStatus,
+  EvidenceRecord,
+  FileMode,
+  LayerRef,
+  ObjectId,
+  Person,
+  ProvenanceRecord,
+  State,
+  Tree,
+} from "../../protocol/src/model";
+import { isObjectId, objectId } from "@javelin/protocol";
+import {
+  decodeObject,
+  encodeObject,
+  hashEncoding,
+  makeTree,
+  type BlobObject,
+  type StoredObject,
+} from "./objects";
+import { diff3, joinLines, splitLines } from "./merge";
+import { MetaStore } from "./meta";
 import { ObjectStore } from "./store";
-
-const NULL_ID = "0".repeat(64);
-
-async function atomicWrite(path: string, contents: string): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const tmp = join(dirname(path), `.tmp-${crypto.randomUUID()}`);
-  await writeFile(tmp, contents);
-  await rename(tmp, path);
-}
-
-export class Refs {
-  constructor(readonly dir: string) {}
-
-  private path(ref: RefName): string {
-    if (!/^refs\/[A-Za-z0-9._/-]+$/.test(ref) || ref.includes("..")) {
-      throw new Error(`invalid ref name: ${ref}`);
-    }
-    return join(this.dir, ...ref.split("/"));
-  }
-
-  async get(ref: RefName): Promise<ObjectId | null> {
-    try {
-      const raw = (await readFile(this.path(ref), "utf8")).trim();
-      if (!isObjectId(raw)) return null;
-      return raw;
-    } catch {
-      return null;
-    }
-  }
-
-  async set(ref: RefName, id: ObjectId | null, expectedOld: ObjectId | null = null): Promise<RefUpdateResult> {
-    const current = await this.get(ref);
-    const effectiveOld = current ?? null;
-    if (expectedOld !== effectiveOld) {
-      return { ref, ok: false, reason: "cas-mismatch", detail: `expected ${expectedOld ?? NULL_ID}, found ${effectiveOld ?? NULL_ID}` };
-    }
-    if (id === null) {
-      try {
-        await rm(this.path(ref));
-      } catch {}
-    } else {
-      await atomicWrite(this.path(ref), id + "\n");
-    }
-    return { ref, ok: true };
-  }
-
-  async list(): Promise<Record<RefName, ObjectId>> {
-    const refs: Record<RefName, ObjectId> = {};
-    const walk = async (rel: string[]): Promise<void> => {
-      const dir = join(this.dir, ...rel);
-      let entries: string[];
-      try {
-        entries = await readdir(dir, { withFileTypes: true }).then((d) => d.map((e) => e.name));
-      } catch {
-        return;
-      }
-      for (const name of entries.sort()) {
-        if (name.startsWith(".tmp-")) continue;
-        const parts = [...rel, name];
-        const id = await this.get(parts.join("/") as RefName);
-        if (id) refs[parts.join("/") as RefName] = id;
-        else await walk(parts);
-      }
-    };
-    await walk([]);
-    return refs;
-  }
-}
 
 export interface Author {
   name: string;
   email: string;
 }
 
-export interface CommitOptions {
-  message: string;
-  author?: Author;
-  committer?: Author;
-  parents?: ObjectId[];
-  time?: string;
+export interface FileEntry {
+  id: ObjectId;
+  mode: FileMode;
 }
+
+export type FileMap = Record<string, FileEntry>;
 
 export interface LogEntry {
   id: ObjectId;
-  commit: Commit;
-}
-
-export interface DiffEntry {
-  path: string;
-  status: "added" | "modified" | "deleted";
-  oldId: ObjectId | null;
-  newId: ObjectId | null;
+  state: State;
 }
 
 export interface MergeConflict {
   path: string;
+  kind: "content" | "add-add" | "delete-modify";
   baseId: ObjectId | null;
   oursId: ObjectId | null;
   theirsId: ObjectId | null;
 }
 
-export interface MergeResult {
+export interface RefreshResult {
   ok: boolean;
-  commitId: ObjectId | null;
+  stateId: ObjectId | null;
   conflicts: MergeConflict[];
+}
+
+export type PublishFailure = "not-found" | "not-open" | "conflict" | "world-moved" | "status-moved";
+
+export interface PublishResult {
+  ok: boolean;
+  idempotent: boolean;
+  worldState: ObjectId | null;
+  reason: PublishFailure | null;
+  conflicts: MergeConflict[];
+}
+
+export interface ContributionMeta {
+  contributionId: ObjectId;
+  status: ContributionStatus;
+  events: ContributionEvent[];
+}
+
+export interface GcResult {
+  removed: number;
 }
 
 export interface FsckIssue {
@@ -119,147 +86,584 @@ export interface FsckIssue {
 export interface FsckResult {
   ok: boolean;
   objects: number;
+  unreachable: ObjectId[];
   issues: FsckIssue[];
+}
+
+const LAYER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const GC_GRACE_MS = 3_600_000;
+
+async function listDir(dir: string): Promise<Dirent[]> {
+  try {
+    return await readdir(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+function person(author?: Author): Person {
+  return {
+    name: author?.name ?? "javelin",
+    email: author?.email ?? "javelin@local",
+    time: now(),
+  };
+}
+
+function worldValue(id: ObjectId | null): string {
+  return JSON.stringify({ value: id });
 }
 
 export class Repository {
   readonly objects: ObjectStore;
-  readonly refs: Refs;
+  readonly meta: MetaStore;
 
-  private constructor(
+  protected constructor(
     readonly root: string,
     private readonly javelinDir: string,
-  ) {
-    this.objects = new ObjectStore(join(javelinDir, "objects"));
-    this.refs = new Refs(join(javelinDir, "refs"));
+  ) {    this.objects = new ObjectStore(join(javelinDir, "objects"));
+    this.meta = new MetaStore(join(javelinDir, "meta"));
   }
 
   static async open(root: string): Promise<Repository> {
     const javelinDir = join(root, ".javelin");
     await mkdir(join(javelinDir, "objects"), { recursive: true });
-    await mkdir(join(javelinDir, "refs"), { recursive: true });
+    await mkdir(join(javelinDir, "meta"), { recursive: true });
     return new Repository(root, javelinDir);
   }
-  private indexPath(): string {
-    return join(this.javelinDir, "index.json");
+
+  /**
+   * Bootstrap an empty repository: an initial empty world state so every layer has a
+   * valid base, plus the current-layer pointer. Safe to call on an already-initialized
+   * repository; concurrent inits converge through CAS on meta/world.
+   */
+  static async init(root: string): Promise<Repository> {
+    const repo = await Repository.open(root);
+    if ((await repo.meta.get("world")) === null) await repo.meta.create("world", worldValue(null));
+    if ((await repo.worldHead()) === null) {
+      const treeId = (await repo.objects.write(makeTree([]))).id;
+      const state: State = { kind: "state", tree: treeId, parents: [], author: person(), message: "init" };
+      const { id } = await repo.objects.write(state);
+      const raw = await repo.meta.get("world");
+      await repo.meta.compareAndSwap("world", raw!, worldValue(id));
+    }
+    await repo.meta.create("current", "world");
+    return repo;
   }
 
-  async readIndex(): Promise<Record<string, ObjectId>> {
-    try {
-      const raw = JSON.parse(await readFile(this.indexPath(), "utf8")) as Record<string, string>;
-      const out: Record<string, ObjectId> = {};
-      for (const [path, id] of Object.entries(raw)) if (isObjectId(id)) out[path] = id;
-      return out;
-    } catch {
-      return {};
+  // ---- world ----
+
+  async worldHead(): Promise<ObjectId | null> {
+    const raw = await this.meta.get("world");
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { value: ObjectId | null };
+    return parsed.value !== null && isObjectId(parsed.value) ? parsed.value : null;
+  }
+
+  async worldLog(limit = 100): Promise<LogEntry[]> {
+    const head = await this.worldHead();
+    if (!head) return [];
+    return this.logFrom(head, limit);
+  }
+
+  // ---- layers ----
+
+  async layerNew(name: string): Promise<LayerRef> {
+    if (!LAYER_NAME_RE.test(name)) throw new Error(`invalid layer name: ${name}`);
+    const world = await this.worldHead();
+    if (!world) throw new Error("world head missing; run init first");
+    const ref: LayerRef = { name, base: world, head: null, updatedAt: now() };
+    const created = await this.meta.create(`layer/${name}`, JSON.stringify(ref));
+    if (!created) throw new Error(`layer already exists: ${name}`);
+    return ref;
+  }
+
+  async layerList(): Promise<LayerRef[]> {
+    const refs: LayerRef[] = [];
+    for (const key of await this.meta.list("layer/")) {
+      const raw = await this.meta.get(key);
+      if (raw) refs.push(JSON.parse(raw) as LayerRef);
+    }
+    return refs.sort((a, b) => (a.name < b.name ? -1 : 1));
+  }
+
+  async layerGet(name: string): Promise<LayerRef | null> {
+    const raw = await this.meta.get(`layer/${name}`);
+    return raw ? (JSON.parse(raw) as LayerRef) : null;
+  }
+
+  /** Checkout a layer (or "world") into the working directory, including deletions. */
+  async layerSwitch(name: string): Promise<LayerRef | "world"> {
+    if (name === "world") {
+      const head = await this.worldHead();
+      if (head) await this.materialize(head);
+      await this.meta.compareAndSwap("current", await this.meta.get("current"), "world");
+      return "world";
+    }
+    const ref = await this.layerGet(name);
+    if (!ref) throw new Error(`no such layer: ${name}`);
+    await this.materialize(ref.head ?? ref.base);
+    await this.meta.compareAndSwap("current", await this.meta.get("current"), name);
+    return ref;
+  }
+
+  /** Delete a layer's metadata. Objects stay; they become unreachable (gc reclaims them). */
+  async layerDiscard(name: string): Promise<void> {
+    const deleted = await this.meta.delete(`layer/${name}`);
+    if (!deleted) throw new Error(`no such layer: ${name}`);
+    if ((await this.meta.get("current")) === name) {
+      await this.meta.compareAndSwap("current", name, "world");
     }
   }
 
-  async writeIndex(index: Record<string, ObjectId>): Promise<void> {
-    await atomicWrite(this.indexPath(), JSON.stringify(index, null, 2) + "\n");
+  async currentLayer(): Promise<string> {
+    return (await this.meta.get("current")) ?? "world";
   }
 
-  async stage(path: string, data: Uint8Array): Promise<ObjectId> {
-    const blob: BlobObject = { kind: "blob", data };
-    const { id } = await this.objects.write(blob);
-    const index = await this.readIndex();
-    index[normalizePath(path)] = id;
-    await this.writeIndex(index);
+  /**
+   * Snapshot the working directory onto the checked-out layer. Parents are the layer's
+   * previous head ([] for the first checkpoint). The layer head moves by CAS; a racing
+   * writer makes the checkpoint fail loudly instead of losing work.
+   */
+  async checkpoint(opts: { message: string; author?: Author; layer?: string }): Promise<{ stateId: ObjectId; layer: string }> {
+    const layer = opts.layer ?? (await this.currentLayer());
+    if (layer === "world") throw new Error("checkpoint requires a checked-out layer");
+    const raw = await this.meta.get(`layer/${layer}`);
+    if (!raw) throw new Error(`no such layer: ${layer}`);
+    const ref = JSON.parse(raw) as LayerRef;
+    const treeId = await this.writeTreeFromFiles(await this.scanWorkingDir());
+    const state: State = {
+      kind: "state",
+      tree: treeId,
+      parents: ref.head ? [ref.head] : [],
+      author: person(opts.author),
+      message: opts.message,
+    };
+    const { id } = await this.objects.write(state);
+    const next: LayerRef = { ...ref, head: id, updatedAt: now() };
+    const moved = await this.meta.compareAndSwap(`layer/${layer}`, raw, JSON.stringify(next));
+    if (!moved.ok) throw new Error(`layer ${layer} moved during checkpoint; retry`);
+    return { stateId: id, layer };
+  }
+
+  async layerLog(layer: string, limit = 100): Promise<LogEntry[]> {
+    const ref = await this.layerGet(layer);
+    if (!ref) throw new Error(`no such layer: ${layer}`);
+    if (!ref.head) return [];
+    return this.logFrom(ref.head, limit);
+  }
+
+  // ---- refresh ----
+
+  /**
+   * Three-way line merge of World into a layer. Base is the common ancestor of the layer
+   * chain and the world chain. On success the merged tree is materialized and the layer
+   * head CAS-advances to a merge state with parents [layerHead, worldHead]. On conflict
+   * nothing is written.
+   */
+  async refresh(layer: string): Promise<RefreshResult> {
+    const ref = await this.layerGet(layer);
+    if (!ref) throw new Error(`no such layer: ${layer}`);
+    if (!ref.head) throw new Error(`layer has no checkpoints: ${layer}`);
+    const world = await this.worldHead();
+    if (!world) throw new Error("world head missing");
+    let base = await this.mergeBase(ref.head, world);
+    if (!base && (await this.isAncestorOrSelf(ref.base, world))) base = ref.base;
+    if (!base || base === world) return { ok: true, stateId: null, conflicts: [] };
+    const { files, conflicts } = await this.mergeTrees(base, ref.head, world);
+    if (!files) return { ok: false, stateId: null, conflicts };
+    const treeId = await this.writeTreeFromFiles(files);
+    const state: State = {
+      kind: "state",
+      tree: treeId,
+      parents: [ref.head, world],
+      author: person(),
+      message: `refresh ${layer}`,
+    };
+    const { id } = await this.objects.write(state);
+    const raw = await this.meta.get(`layer/${layer}`);
+    const moved = await this.meta.compareAndSwap(
+      `layer/${layer}`,
+      raw!,
+      JSON.stringify({ ...ref, head: id, updatedAt: now() } satisfies LayerRef),
+    );
+    if (!moved.ok) throw new Error(`layer ${layer} moved during refresh; retry`);
+    await this.materialize(id);
+    return { ok: true, stateId: id, conflicts: [] };
+  }
+
+  // ---- contributions ----
+
+  async contribute(layer: string, title: string, author: Author): Promise<ObjectId> {
+    const ref = await this.layerGet(layer);
+    if (!ref) throw new Error(`no such layer: ${layer}`);
+    if (!ref.head) throw new Error(`layer has no checkpoints: ${layer}`);
+    const contribution: Contribution = {
+      kind: "contribution",
+      layer,
+      state: ref.head,
+      base: ref.base,
+      title,
+      author: person(author),
+      createdAt: now(),
+    };
+    const { id } = await this.objects.write(contribution);
+    const meta: ContributionMeta = {
+      contributionId: id,
+      status: "open",
+      events: [{ status: "open", at: now(), by: author.name }],
+    };
+    const created = await this.meta.create(`contrib/${id}`, JSON.stringify(meta));
+    if (!created) throw new Error(`contribution already exists: ${id}`);
     return id;
   }
 
-  async unstage(path: string): Promise<void> {
-    const index = await this.readIndex();
-    delete index[normalizePath(path)];
-    await this.writeIndex(index);
+  async contribution(id: ObjectId): Promise<{ contribution: Contribution; meta: ContributionMeta } | null> {
+    const raw = await this.meta.get(`contrib/${id}`);
+    if (!raw) return null;
+    const obj = await this.objects.read(id);
+    if (!obj || obj.kind !== "contribution") throw new Error(`missing contribution object: ${id}`);
+    return { contribution: obj, meta: JSON.parse(raw) as ContributionMeta };
   }
 
-  async buildTreeFromIndex(): Promise<ObjectId> {
-    const index = await this.readIndex();
-    return this.writeFlatTree(index);
+  /**
+   * Integrate a contribution into World. The world head moves by CAS from the value the
+   * merge was computed against; if it moved mid-publish nothing changes and the caller
+   * refreshes. Re-publishing a published contribution is a no-op success.
+   */
+  async publish(contributionId: ObjectId, author: Author): Promise<PublishResult> {
+    const key = `contrib/${contributionId}`;
+    const raw = await this.meta.get(key);
+    if (!raw) return this.publishFailure("not-found");
+    const cmeta = JSON.parse(raw) as ContributionMeta;
+    if (cmeta.status === "published") {
+      const worldState = [...cmeta.events].reverse().find((e) => e.status === "published")?.worldState ?? null;
+      return { ok: true, idempotent: true, worldState, reason: null, conflicts: [] };
+    }
+    if (cmeta.status !== "open") return this.publishFailure("not-open");
+    const obj = await this.objects.read(contributionId);
+    if (!obj || obj.kind !== "contribution") throw new Error(`missing contribution object: ${contributionId}`);
+    const contribution = obj;
+    const worldRaw = await this.meta.get("world");
+    const world = worldRaw === null ? null : (JSON.parse(worldRaw) as { value: ObjectId | null }).value;
+    if (!world) throw new Error("world head missing");
+    if (contribution.state === world) {
+      const event: ContributionEvent = { status: "published", at: now(), by: author.name, worldState: world };
+      const moved = await this.meta.compareAndSwap(
+        key,
+        raw,
+        JSON.stringify({ ...cmeta, status: "published", events: [...cmeta.events, event] } satisfies ContributionMeta),
+      );
+      if (!moved.ok) return this.publishFailure("status-moved");
+      return { ok: true, idempotent: false, worldState: world, reason: null, conflicts: [] };
+    }
+    const base =
+      (await this.isAncestorOrSelf(contribution.base, world))
+        ? contribution.base
+        : await this.mergeBase(contribution.state, world);
+    if (!base) throw new Error("no merge base between contribution and world");
+    const { files, conflicts } = await this.mergeTrees(base, contribution.state, world);
+    if (!files) return { ok: false, idempotent: false, worldState: null, reason: "conflict", conflicts };
+    const treeId = await this.writeTreeFromFiles(files);
+    const state: State = {
+      kind: "state",
+      tree: treeId,
+      parents: [world, contribution.state],
+      author: person(author),
+      message: `publish ${contribution.layer}: ${contribution.title}`,
+    };
+    const { id } = await this.objects.write(state);
+    if (!(await this.casWorld(worldRaw!, id))) return this.publishFailure("world-moved");
+    const event: ContributionEvent = { status: "published", at: now(), by: author.name, worldState: id };
+    const statusMoved = await this.meta.compareAndSwap(
+      key,
+      raw,
+      JSON.stringify({ ...cmeta, status: "published", events: [...cmeta.events, event] } satisfies ContributionMeta),
+    );
+    if (!statusMoved.ok) return this.publishFailure("status-moved");
+    return { ok: true, idempotent: false, worldState: id, reason: null, conflicts: [] };
   }
 
-  private async writeFlatTree(files: Record<string, ObjectId>): Promise<ObjectId> {
-    type Dir = Map<string, Dir | ObjectId>;
-    const rootDir: Dir = new Map();
-    for (const [path, id] of Object.entries(files)) {
-      const parts = normalizePath(path).split("/");
-      let dir = rootDir;
-      for (const part of parts.slice(0, -1)) {
-      let next = dir.get(part);
-      if (!(next instanceof Map)) {
-        next = new Map();
-        dir.set(part, next);
+  /** CAS the world head from the exact value this publish merged against. */
+  protected async casWorld(expectedRaw: string, next: ObjectId): Promise<boolean> {
+    return (await this.meta.compareAndSwap("world", expectedRaw, worldValue(next))).ok;
+  }
+
+  private publishFailure(reason: PublishFailure): PublishResult {
+    return { ok: false, idempotent: false, worldState: null, reason, conflicts: [] };
+  }
+
+  // ---- provenance and evidence (append-only, docs/adr/0005) ----
+
+  async recordProvenance(record: Omit<ProvenanceRecord, "kind">): Promise<ObjectId> {
+    const { id } = await this.objects.write({ kind: "provenance", ...record });
+    return id;
+  }
+
+  async recordEvidence(record: Omit<EvidenceRecord, "kind">): Promise<ObjectId> {
+    const { id } = await this.objects.write({ kind: "evidence", ...record });
+    return id;
+  }
+
+  /**
+   * Lookup scans the object store for records referencing the state. A derived index
+   * was deliberately not added (docs/adr/0005); if benchmarks demand one it must stay a
+   * rebuildable view, never the source of truth.
+   */
+  async provenanceFor(stateId: ObjectId): Promise<{ id: ObjectId; record: ProvenanceRecord }[]> {
+    return this.scanRefs("provenance", stateId) as Promise<{ id: ObjectId; record: ProvenanceRecord }[]>;
+  }
+
+  async evidenceFor(stateId: ObjectId): Promise<{ id: ObjectId; record: EvidenceRecord }[]> {
+    return this.scanRefs("evidence", stateId) as Promise<{ id: ObjectId; record: EvidenceRecord }[]>;
+  }
+
+  private async scanRefs(
+    kind: "provenance" | "evidence",
+    stateId: ObjectId,
+  ): Promise<{ id: ObjectId; record: ProvenanceRecord | EvidenceRecord }[]> {
+    const hits: { id: ObjectId; record: ProvenanceRecord | EvidenceRecord }[] = [];
+    for (const id of await this.objects.list()) {
+      const obj = await this.objects.read(id);
+      if (!obj || obj.kind !== kind) continue;
+      const references =
+        obj.kind === "provenance" ? obj.states.includes(stateId) : obj.kind === "evidence" ? obj.state === stateId : false;
+      if (references) hits.push({ id, record: obj });
+    }
+    return hits;
+  }
+
+  // ---- materialize and scan ----
+
+  /** Write a state's tree to a directory, removing files the state does not contain. */
+  async materialize(stateId: ObjectId, targetDir: string = this.root): Promise<void> {
+    const state = await this.loadState(stateId);
+    await this.writeWorkingTree(await this.flattenTree(state.tree), targetDir);
+  }
+
+  async scanWorkingDir(dir: string = this.root): Promise<FileMap> {
+    const files: FileMap = {};
+    const walk = async (d: string, prefix: string, depth: number): Promise<void> => {
+      for (const entry of await readdir(d, { withFileTypes: true })) {
+        if (depth === 0 && entry.name === ".javelin") continue;
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        const path = join(d, entry.name);
+        if (entry.isDirectory()) {
+          await walk(path, rel, depth + 1);
+        } else if (entry.isFile()) {
+          const blob: BlobObject = { kind: "blob", data: new Uint8Array(await readFile(path)) };
+          const mode = (await stat(path)).mode & 0o111 ? "exec" : "file";
+          files[rel] = { id: (await this.objects.write(blob)).id, mode };
+        } else if (entry.isSymbolicLink()) {
+          const blob: BlobObject = { kind: "blob", data: new TextEncoder().encode(await readlink(path)) };
+          files[rel] = { id: (await this.objects.write(blob)).id, mode: "symlink" };
+        }
       }
+    };
+    await walk(dir, "", 0);
+    return files;
+  }
+
+  private async writeWorkingTree(files: FileMap, targetDir: string): Promise<void> {
+    await this.pruneAbsent(files, targetDir, "", 0);
+    for (const rel of Object.keys(files).sort()) {
+      const entry = files[rel]!;
+      const dest = join(targetDir, rel);
+      await mkdir(dirname(dest), { recursive: true });
+      const blob = await this.readBlob(entry.id);
+      if (entry.mode === "symlink") {
+        await rm(dest, { force: true, recursive: true });
+        await symlink(new TextDecoder().decode(blob), dest);
+        continue;
+      }
+      try {
+        if ((await lstat(dest)).isSymbolicLink()) await rm(dest, { force: true });
+      } catch {}
+      const tmp = join(dirname(dest), `.javelin-tmp-${crypto.randomUUID()}`);
+      await writeFile(tmp, blob);
+      await rename(tmp, dest);
+      await chmod(dest, entry.mode === "exec" ? 0o755 : 0o644);
+    }
+  }
+
+  private async pruneAbsent(files: FileMap, dir: string, prefix: string, depth: number): Promise<void> {
+    for (const entry of await listDir(dir)) {
+      if (depth === 0 && entry.name === ".javelin") continue;
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await this.pruneAbsent(files, path, rel, depth + 1);
+        await rmdir(path).catch(() => {});
+      } else if (!files[rel]) {
+        await rm(path, { force: true });
+      }
+    }
+  }
+
+  // ---- tree helpers ----
+
+  private async flattenTree(treeId: ObjectId): Promise<FileMap> {
+    const files: FileMap = {};
+    const walk = async (id: ObjectId, dir: string): Promise<void> => {
+      for (const entry of (await this.loadTree(id)).entries) {
+        const full = dir ? `${dir}/${entry.name}` : entry.name;
+        if (entry.kind === "tree") await walk(entry.id, full);
+        else files[full] = { id: entry.id, mode: entry.mode };
+      }
+    };
+    await walk(treeId, "");
+    return files;
+  }
+
+  private async writeTreeFromFiles(files: FileMap): Promise<ObjectId> {
+    type Dir = Map<string, Dir | FileEntry>;
+    const root: Dir = new Map();
+    for (const [path, entry] of Object.entries(files)) {
+      const parts = path.split("/");
+      let dir = root;
+      for (const part of parts.slice(0, -1)) {
+        let next = dir.get(part);
+        if (!(next instanceof Map)) {
+          next = new Map();
+          dir.set(part, next);
+        }
         dir = next;
       }
-      dir.set(parts[parts.length - 1]!, id);
+      dir.set(parts[parts.length - 1]!, entry);
     }
     const writeDir = async (dir: Dir): Promise<ObjectId> => {
       const entries = [];
       for (const [name, value] of [...dir.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
         if (value instanceof Map) {
-          entries.push({ name, kind: "tree" as const, id: await writeDir(value) });
+          entries.push({ name, mode: "file" as const, kind: "tree" as const, id: await writeDir(value) });
         } else {
-          entries.push({ name, kind: "blob" as const, id: value });
+          entries.push({ name, mode: value.mode, kind: "blob" as const, id: value.id });
         }
       }
-      const tree = makeTree(entries);
-      const { id } = await this.objects.write(tree);
-      return id;
+      return (await this.objects.write(makeTree(entries))).id;
     };
-    return writeDir(rootDir);
+    return writeDir(root);
   }
 
-  async commit(opts: CommitOptions): Promise<ObjectId> {
-    const head = await this.refs.get(`refs/heads/${await this.currentBranch()}`);
-    const headFiles = head ? await this.readCommitTree(head) : {};
-    const index = await this.readIndex();
-    const files = { ...headFiles, ...index };
-    const tree = await this.writeFlatTree(files);
-    const time = opts.time ?? new Date().toISOString();
-    const author = opts.author ?? { name: "javelin", email: "javelin@local" };
-    const committer = opts.committer ?? author;
-    const parents = opts.parents ?? (head ? [head] : []);
-    const commit = {
-      kind: "commit" as const,
-      tree,
-      parents,
-      author: { ...author, time },
-      committer: { ...committer, time },
-      message: opts.message,
-    };
-    const { id } = await this.objects.write(commit);
-    const branch = `refs/heads/${await this.currentBranch()}`;
-    const result = await this.refs.set(branch, id, head);
-    if (!result.ok) throw new Error(`commit failed to move ${branch}: ${result.detail}`);
-    await this.writeIndex(files);
-    return id;
-  }
+  // ---- merge ----
 
-  async currentBranch(): Promise<string> {
-    const head = await this.headBranch();
-    if (head) return head;
-    return "main";
-  }
-
-  private async headBranch(): Promise<string | null> {
-    try {
-      const raw = (await readFile(join(this.javelinDir, "HEAD"), "utf8")).trim();
-      const m = /^ref: (refs\/heads\/.+)$/.exec(raw);
-      return m ? m[1]!.slice("refs/heads/".length) : null;
-    } catch {
-      return null;
+  private async mergeTrees(
+    baseState: ObjectId | null,
+    oursState: ObjectId,
+    theirsState: ObjectId,
+  ): Promise<{ files: FileMap | null; conflicts: MergeConflict[] }> {
+    const [baseFiles, oursFiles, theirsFiles] = await Promise.all([
+      baseState ? this.flattenTree((await this.loadState(baseState)).tree) : Promise.resolve({} as FileMap),
+      this.flattenTree((await this.loadState(oursState)).tree),
+      this.flattenTree((await this.loadState(theirsState)).tree),
+    ]);
+    const stamp = (entry: FileEntry | undefined): string | null => (entry ? `${entry.mode}:${entry.id}` : null);
+    const files: FileMap = {};
+    const conflicts: MergeConflict[] = [];
+    const paths = [...new Set([...Object.keys(baseFiles), ...Object.keys(oursFiles), ...Object.keys(theirsFiles)])].sort();
+    for (const path of paths) {
+      const b = baseFiles[path];
+      const o = oursFiles[path];
+      const t = theirsFiles[path];
+      const bs = stamp(b);
+      const os = stamp(o);
+      const ts = stamp(t);
+      if (os === ts) {
+        if (o) files[path] = o;
+        continue;
+      }
+      if (os === bs) {
+        if (t) files[path] = t;
+        continue;
+      }
+      if (ts === bs) {
+        if (o) files[path] = o;
+        continue;
+      }
+      if (!b || !o || !t) {
+        conflicts.push({
+          path,
+          kind: !b ? "add-add" : "delete-modify",
+          baseId: b?.id ?? null,
+          oursId: o?.id ?? null,
+          theirsId: t?.id ?? null,
+        });
+        continue;
+      }
+      if (o.mode !== t.mode && o.mode !== b.mode && t.mode !== b.mode) {
+        conflicts.push({ path, kind: "content", baseId: b.id, oursId: o.id, theirsId: t.id });
+        continue;
+      }
+      const mode: FileMode = o.mode !== b.mode ? o.mode : t.mode;
+      const decode = async (id: ObjectId): Promise<string[]> =>
+        splitLines(new TextDecoder().decode(await this.readBlob(id)));
+      const [baseLines, ourLines, theirLines] = await Promise.all([decode(b.id), decode(o.id), decode(t.id)]);
+      const merged = diff3(baseLines, ourLines, theirLines);
+      if (!merged.lines) {
+        conflicts.push({ path, kind: "content", baseId: b.id, oursId: o.id, theirsId: t.id });
+        continue;
+      }
+      const blob: BlobObject = { kind: "blob", data: joinLines(merged.lines) };
+      files[path] = { id: (await this.objects.write(blob)).id, mode };
     }
+    return conflicts.length > 0 ? { files: null, conflicts } : { files, conflicts: [] };
   }
 
-  async setHeadBranch(branch: string): Promise<void> {
-    await atomicWrite(join(this.javelinDir, "HEAD"), `ref: refs/heads/${branch}\n`);
+  private async logFrom(start: ObjectId, limit: number): Promise<LogEntry[]> {
+    const seen = new Set<string>();
+    const queue = [start];
+    const entries: LogEntry[] = [];
+    while (queue.length > 0 && entries.length < limit) {
+      const id = queue.shift()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const state = await this.loadState(id);
+      entries.push({ id, state });
+      queue.unshift(...[...state.parents].reverse());
+    }
+    return entries;
   }
 
-  async loadCommit(id: ObjectId): Promise<Commit> {
+  private async ancestorSet(id: ObjectId): Promise<Set<string>> {
+    const seen = new Set<string>();
+    const queue = [id];
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (seen.has(current)) continue;
+      seen.add(current);
+      const state = await this.loadState(current);
+      queue.push(...state.parents);
+    }
+    return seen;
+  }
+
+  private async mergeBase(a: ObjectId, b: ObjectId): Promise<ObjectId | null> {
+    const aAncestors = await this.ancestorSet(a);
+    const seen = new Set<string>();
+    const queue = [b];
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (aAncestors.has(current)) return current;
+      if (seen.has(current)) continue;
+      seen.add(current);
+      const state = await this.loadState(current);
+      queue.push(...state.parents);
+    }
+    return null;
+  }
+
+  private async isAncestorOrSelf(ancestor: ObjectId, descendant: ObjectId): Promise<boolean> {
+    return (await this.ancestorSet(descendant)).has(ancestor);
+  }
+
+  // ---- object readers ----
+
+  async loadState(id: ObjectId): Promise<State> {
     const obj = await this.objects.read(id);
-    if (!obj || obj.kind !== "commit") throw new Error(`not a commit: ${id}`);
+    if (!obj || obj.kind !== "state") throw new Error(`not a state: ${id}`);
     return obj;
   }
 
@@ -269,261 +673,106 @@ export class Repository {
     return obj;
   }
 
-  async readTree(path: string, treeId: ObjectId): Promise<Record<string, ObjectId>> {
-    const flat: Record<string, ObjectId> = {};
-    const prefix = normalizePath(path);
-    const walk = async (id: ObjectId, dir: string): Promise<void> => {
-      const tree = await this.loadTree(id);
-      for (const entry of tree.entries) {
-        const full = dir ? `${dir}/${entry.name}` : entry.name;
-        if (prefix && !full.startsWith(prefix + "/") && full !== prefix) continue;
-        if (entry.kind === "blob") flat[full] = entry.id;
-        else await walk(entry.id, full);
-      }
-    };
-    await walk(treeId, "");
-    return flat;
-  }
-
-  async readCommitTree(commitId: ObjectId): Promise<Record<string, ObjectId>> {
-    const commit = await this.loadCommit(commitId);
-    return this.readTree("", commit.tree);
-  }
-
-  async resolveToCommit(refOrId: string): Promise<ObjectId> {
-    if (isObjectId(refOrId)) return refOrId;
-    for (const candidate of [`refs/heads/${refOrId}`, `refs/tags/${refOrId}`, refOrId]) {
-      const id = await this.refs.get(candidate);
-      if (id) return id;
-    }
-    throw new Error(`cannot resolve ${refOrId} to a commit`);
-  }
-
-  async log(start: string, limit = 100): Promise<LogEntry[]> {
-    const startId = await this.resolveToCommit(start);
-    const seen = new Set<string>();
-    const queue = [startId];
-    const entries: LogEntry[] = [];
-    while (queue.length > 0 && entries.length < limit) {
-      const id = queue.shift()!;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      const commit = await this.loadCommit(id);
-      entries.push({ id, commit });
-      for (const parent of [...commit.parents].reverse()) queue.unshift(parent);
-    }
-    return entries;
-  }
-
-  async checkout(target: string): Promise<void> {
-    const commitId = await this.resolveToCommit(target);
-    const files = await this.readCommitTree(commitId);
-    await this.applyToWorkingTree(files);
-    await this.writeIndex(files);
-    for (const ref of [`refs/heads/${target}`, `refs/tags/${target}`]) {
-      if (await this.refs.get(ref)) {
-        if (ref.startsWith("refs/heads/")) {
-          await this.setHeadBranch(target);
-        }
-        break;
-      }
-    }
-  }
-
-  private async applyToWorkingTree(files: Record<string, ObjectId>): Promise<void> {
-    for (const [path, id] of Object.entries(files)) {
-      const obj = await this.objects.read(id);
-      if (!obj || obj.kind !== "blob") throw new Error(`missing blob ${id} for ${path}`);
-      await atomicWriteBytes(join(this.root, path), obj.data);
-    }
-  }
-
   async readBlob(id: ObjectId): Promise<Uint8Array> {
     const obj = await this.objects.read(id);
     if (!obj || obj.kind !== "blob") throw new Error(`not a blob: ${id}`);
     return obj.data;
   }
 
-  async diff(a: string, b: string): Promise<DiffEntry[]> {
-    const [filesA, filesB] = await Promise.all([
-      this.commitFlat(a),
-      this.commitFlat(b),
-    ]);
-    const entries: DiffEntry[] = [];
-    for (const path of [...new Set([...Object.keys(filesA), ...Object.keys(filesB)])].sort()) {
-      const oldId = filesA[path] ?? null;
-      const newId = filesB[path] ?? null;
-      if (oldId === newId) continue;
-      if (!oldId) entries.push({ path, status: "added", oldId, newId });
-      else if (!newId) entries.push({ path, status: "deleted", oldId, newId });
-      else entries.push({ path, status: "modified", oldId, newId });
+  // ---- gc and fsck ----
+
+  async gc(): Promise<GcResult> {
+    const keep = await this.collectReachable();
+    const cutoff = Date.now() - GC_GRACE_MS;
+    let removed = 0;
+    for (const id of await this.objects.list()) {
+      if (keep.has(id)) continue;
+      const mtime = await this.objects.mtime(id);
+      if (mtime === null || mtime > cutoff) continue;
+      await this.objects.remove(id);
+      removed++;
     }
-    return entries;
-  }
-
-  private async commitFlat(ref: string): Promise<Record<string, ObjectId>> {
-    const commitId = await this.resolveToCommit(ref);
-    return this.readCommitTree(commitId);
-  }
-
-  async createBranch(name: string, from?: string): Promise<RefUpdateResult> {
-    const start = from ?? (await this.currentBranch());
-    const commitId = await this.resolveToCommit(start);
-    return this.refs.set(`refs/heads/${name}`, commitId);
-  }
-
-  async deleteBranch(name: string): Promise<RefUpdateResult> {
-    const ref = `refs/heads/${name}`;
-    if ((await this.currentBranch()) === name) {
-      return { ref, ok: false, reason: "policy-rejected", detail: "cannot delete the checked-out branch" };
-    }
-    const id = await this.refs.get(ref);
-    return this.refs.set(ref, null, id);
-  }
-
-  async listBranches(): Promise<{ name: string; id: ObjectId }[]> {
-    const refs = await this.refs.list();
-    return Object.entries(refs)
-      .filter(([ref]) => ref.startsWith("refs/heads/"))
-      .map(([ref, id]) => ({ name: ref.slice("refs/heads/".length), id }));
-  }
-
-  private async ancestors(id: ObjectId): Promise<Set<string>> {
-    const seen = new Set<string>();
-    const queue = [id];
-    while (queue.length > 0) {
-      const current = queue.shift()!;
-      if (seen.has(current)) continue;
-      seen.add(current);
-      const commit = await this.loadCommit(current);
-      queue.push(...commit.parents);
-    }
-    return seen;
-  }
-
-  private async mergeBase(ours: ObjectId, theirs: ObjectId): Promise<ObjectId | null> {
-    const oursAncestors = await this.ancestors(ours);
-    const seen = new Set<string>();
-    const queue = [theirs];
-    while (queue.length > 0) {
-      const current = queue.shift()!;
-      if (oursAncestors.has(current)) return current;
-      if (seen.has(current)) continue;
-      seen.add(current);
-      const commit = await this.loadCommit(current);
-      queue.push(...commit.parents);
-    }
-    return null;
-  }
-
-  async mergeBranch(other: string, opts?: { author?: Author; message?: string }): Promise<MergeResult> {
-    const oursId = await this.resolveToCommit(await this.currentBranch());
-    const theirsId = await this.resolveToCommit(other);
-    if (oursId === theirsId) return { ok: true, commitId: oursId, conflicts: [] };
-    const baseId = await this.mergeBase(oursId, theirsId);
-    if (baseId === theirsId) return { ok: true, commitId: oursId, conflicts: [] };
-    const baseFiles = baseId ? await this.readCommitTree(baseId) : {};
-    const oursFiles = await this.readCommitTree(oursId);
-    const theirsFiles = await this.readCommitTree(theirsId);
-
-    const merged: Record<string, ObjectId> = { ...oursFiles };
-    const conflicts: MergeConflict[] = [];
-    for (const path of new Set([...Object.keys(baseFiles), ...Object.keys(theirsFiles)])) {
-      const b = baseFiles[path] ?? null;
-      const o = oursFiles[path] ?? null;
-      const t = theirsFiles[path] ?? null;
-      if (t === b || t === o) continue;
-      if (o === b) {
-        if (t === null) delete merged[path];
-        else merged[path] = t;
-        continue;
-      }
-      conflicts.push({ path, baseId: b, oursId: o, theirsId: t });
-    }
-    if (conflicts.length > 0) {
-      conflicts.sort((a, b) => (a.path < b.path ? -1 : 1));
-      return { ok: false, commitId: null, conflicts };
-    }
-    await this.applyToWorkingTree(merged);
-    await this.writeIndex(merged);
-    const message = opts?.message ?? `merge branch '${other}'`;
-    const time = new Date().toISOString();
-    const author = opts?.author ?? { name: "javelin", email: "javelin@local" };
-    const mergeCommit = {
-      kind: "commit" as const,
-      tree: await this.writeFlatTree(merged),
-      parents: [oursId, theirsId],
-      author: { ...author, time },
-      committer: { ...author, time },
-      message,
-    };
-    const { id } = await this.objects.write(mergeCommit);
-    const head = await this.refs.get(`refs/heads/${await this.currentBranch()}`);
-    await this.refs.set(`refs/heads/${await this.currentBranch()}`, id, head);
-    return { ok: true, commitId: id, conflicts: [] };
+    return { removed };
   }
 
   async fsck(): Promise<FsckResult> {
     const issues: FsckIssue[] = [];
-    const reachable = new Set<string>();
-    const verify = async (id: ObjectId): Promise<StoredObject | null> => {
-      const obj = await this.objects.read(id);
-      if (!obj) {
-        const raw = await this.objects.readRaw(id);
-        issues.push({ id, problem: raw ? "corrupt object" : "missing object" });
-        return null;
-      }
-      const expected = await hashEncoding(encodeObject(obj));
-      if (expected !== id) issues.push({ id, problem: `hash mismatch: content hashes to ${expected}` });
-      reachable.add(id);
-      return obj;
-    };
-    const walkTree = async (id: ObjectId): Promise<void> => {
-      const tree = await verify(id);
-      if (!tree || tree.kind !== "tree") return;
-      for (const entry of sortTreeEntries(tree.entries)) {
-        if (reachable.has(entry.id)) continue;
-        if (entry.kind === "tree") await walkTree(entry.id);
-        else await verify(entry.id);
-      }
-    };
-    const walkCommit = async (id: ObjectId): Promise<void> => {
-      const commit = await verify(id);
-      if (!commit || commit.kind !== "commit") return;
-      await walkTree(commit.tree);
-      for (const parent of commit.parents) {
-        if (!reachable.has(parent)) await walkCommit(parent);
-      }
-      for (const prov of commit.provenance ?? []) {
-        if (!reachable.has(prov)) await verify(prov);
-      }
-    };
-    for (const id of Object.values(await this.refs.list())) {
-      const obj = await this.objects.read(id);
-      if (!obj) {
-        issues.push({ id, problem: "missing object referenced by ref" });
+    const ids = await this.objects.list();
+    let verified = 0;
+    for (const id of ids) {
+      const raw = await this.objects.readRaw(id);
+      if (!raw) {
+        issues.push({ id, problem: "missing object" });
         continue;
       }
-      if (obj.kind === "commit") await walkCommit(id);
-      else if (obj.kind === "tag") await verify(obj.target);
-      else await verify(id);
+      let obj: StoredObject;
+      try {
+        obj = decodeObject(raw);
+      } catch {
+        issues.push({ id, problem: "undecodable object" });
+        continue;
+      }
+      if ((await hashEncoding(encodeObject(obj))) !== id) issues.push({ id, problem: "hash mismatch" });
+      verified++;
     }
-    return { ok: issues.length === 0, objects: reachable.size, issues };
+    const keep = await this.collectReachable();
+    const unreachable = ids.filter((id) => !keep.has(id));
+    return { ok: issues.length === 0, objects: verified, unreachable, issues };
   }
-}
 
-export function normalizePath(path: string): string {
-  return path.replace(/^\.\//, "").replace(/\/+$/, "");
+  /** Reachability roots: world head, layer bases and heads, all contributions, and provenance/evidence referencing reachable states. */
+  private async collectReachable(): Promise<Set<string>> {
+    const keep = new Set<string>();
+    const markTree = async (id: ObjectId): Promise<void> => {
+      if (keep.has(id)) return;
+      keep.add(id);
+      for (const entry of (await this.loadTree(id)).entries) {
+        if (entry.kind === "tree") await markTree(entry.id);
+        else keep.add(entry.id);
+      }
+    };
+    const markState = async (id: ObjectId): Promise<void> => {
+      if (keep.has(id)) return;
+      keep.add(id);
+      const state = await this.loadState(id);
+      await markTree(state.tree);
+      for (const parent of state.parents) await markState(parent);
+    };
+    const roots: ObjectId[] = [];
+    const world = await this.worldHead();
+    if (world) roots.push(world);
+    for (const ref of await this.layerList()) {
+      roots.push(ref.base);
+      if (ref.head) roots.push(ref.head);
+    }
+    for (const key of await this.meta.list("contrib/")) {
+      const id = objectId(key.slice("contrib/".length));
+      keep.add(id);
+      const contribution = await this.objects.read(id);
+      if (contribution && contribution.kind === "contribution") roots.push(contribution.state, contribution.base);
+    }
+    for (const id of roots) {
+      const obj = await this.objects.read(id);
+      if (!obj) continue;
+      if (obj.kind === "state") await markState(id);
+      else if (obj.kind === "tree") await markTree(id);
+      else keep.add(id);
+    }
+    for (const id of await this.objects.list()) {
+      if (keep.has(id)) continue;
+      const obj = await this.objects.read(id);
+      if (!obj) continue;
+      if (obj.kind === "provenance" && obj.states.some((s) => keep.has(s))) keep.add(id);
+      else if (obj.kind === "evidence" && keep.has(obj.state)) keep.add(id);
+    }
+    return keep;
+  }
 }
 
 export async function openRepository(rootPath: string): Promise<Repository> {
   return Repository.open(rootPath);
 }
 
-async function atomicWriteBytes(path: string, data: Uint8Array): Promise<void> {
-  const { mkdir, writeFile, rename } = await import("node:fs/promises");
-  await mkdir(dirname(path), { recursive: true });
-  const tmp = join(dirname(path), `.javelin-tmp-${crypto.randomUUID()}`);
-  await writeFile(tmp, data);
-  await rename(tmp, path);
+export async function init(rootPath: string): Promise<Repository> {
+  return Repository.init(rootPath);
 }

@@ -12,8 +12,21 @@ export interface WriteResult {
 export class ObjectStore {
   constructor(readonly dir: string) {}
 
-  private shardPath(id: ObjectId): string {
+  shardPath(id: ObjectId): string {
     return join(this.dir, id.slice(0, 2), id.slice(2));
+  }
+
+  /** File mtime in ms, or null when absent. */
+  async mtime(id: ObjectId): Promise<number | null> {
+    try {
+      return (await stat(this.shardPath(id))).mtimeMs;
+    } catch {
+      return null;
+    }
+  }
+
+  async remove(id: ObjectId): Promise<void> {
+    await rm(this.shardPath(id), { force: true });
   }
 
   async write(obj: StoredObject): Promise<WriteResult> {

@@ -20,8 +20,8 @@ afterEach(async () => {
 
 describe("canonical encoding", () => {
   test("key order does not affect id", async () => {
-    const a = { kind: "commit" as const, tree: treeId, parents: [], message: "hi", author: { name: "n", email: "e", time: "t" }, committer: { name: "n", email: "e", time: "t" } };
-    const b = { message: "hi", committer: { time: "t", email: "e", name: "n" }, author: { time: "t", email: "e", name: "n" }, parents: [], tree: treeId, kind: "commit" as const };
+    const a = { kind: "state" as const, tree: treeId, parents: [], message: "hi", author: { name: "n", email: "e", time: "t" } };
+    const b = { message: "hi", author: { time: "t", email: "e", name: "n" }, parents: [], tree: treeId, kind: "state" as const };
     expect(await hashEncoding(encodeObject(a))).toBe(await hashEncoding(encodeObject(b)));
   });
 
@@ -35,9 +35,10 @@ describe("canonical encoding", () => {
     expect(decoded).toEqual({ kind: "blob", data });
   });
 
-  test("tree round-trips", () => {
-    const tree = { kind: "tree" as const, entries: [{ name: "a.txt", kind: "blob" as const, id: blobId }] };
-    expect(decodeObject(encodeObject(tree))).toEqual(tree);
+  test("tree entry carries mode", () => {
+    const tree = { kind: "tree" as const, entries: [{ name: "run.sh", mode: "exec" as const, kind: "blob" as const, id: blobId }] };
+    const round = decodeObject(encodeObject(tree));
+    expect(round).toEqual(tree);
   });
 });
 

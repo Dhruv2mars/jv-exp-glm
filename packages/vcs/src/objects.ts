@@ -1,4 +1,4 @@
-import type { JvlObject, ObjectKind, ObjectId, Tree, TreeEntry } from "@javelin/protocol";
+import type { Contribution, EvidenceRecord, ObjectId, ProvenanceRecord, State, Tree, TreeEntry } from "../../protocol/src/model";
 import { objectId } from "@javelin/protocol";
 
 const SHA256_ALGO = "SHA-256";
@@ -10,7 +10,7 @@ export interface BlobObject {
   data: Uint8Array;
 }
 
-export type StoredObject = BlobObject | Extract<JvlObject, { kind: Exclude<ObjectKind, "blob"> }>;
+export type StoredObject = BlobObject | Tree | State | ProvenanceRecord | EvidenceRecord | Contribution;
 
 export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -24,10 +24,10 @@ export function canonicalJson(value: unknown): string {
 const KIND_PREFIX: Record<string, number> = {
   blob: 0x01,
   tree: 0x02,
-  commit: 0x03,
-  tag: 0x04,
+  state: 0x03,
   provenance: 0x05,
   evidence: 0x06,
+  contribution: 0x07,
 };
 
 const PREFIX_KIND: Record<number, string> = Object.fromEntries(
