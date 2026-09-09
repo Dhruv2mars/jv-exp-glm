@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ObjectId } from "../../protocol/src/model";
+import type { ObjectId } from "@javelin/protocol";
 import { init, openRepository, Repository, type Author, type ContributionMeta, type FileMap, type MergeConflict, type PublishResult } from "./repo";
 import { ObjectStore } from "./store";
 import { MetaStore } from "./meta";

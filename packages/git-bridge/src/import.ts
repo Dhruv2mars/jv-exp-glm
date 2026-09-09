@@ -1,6 +1,6 @@
 import type { ObjectId } from "@javelin/protocol";
 import { openRepository, makeTree, type BlobObject } from "@javelin/vcs";
-import type { FileMode, LayerRef, State, TreeEntry } from "../../protocol/src/model";
+import type { FileMode, LayerRef, State, TreeEntry } from "@javelin/protocol";
 import { git, gitBinary, parseCommitObject, parseLsTree, parseTagObject } from "./git";
 import { loadBridgeMap, saveBridgeMap, writeMirrorMarker, type MirrorMode } from "./bridge";
 

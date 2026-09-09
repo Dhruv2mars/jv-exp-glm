@@ -9,7 +9,7 @@ import {
   type WireObject,
 } from "@javelin/protocol";
 import { JavelinClient, JrpError, type Contribution, type HeadsView } from "@javelin/sdk";
-import type { ContributionEvent, ContributionStatus, State } from "../../../packages/protocol/src/model";
+import type { ContributionEvent, ContributionStatus, State } from "@javelin/protocol";
 import {
   diff3,
   encodeObject,

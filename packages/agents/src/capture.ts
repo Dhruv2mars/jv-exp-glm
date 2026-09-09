@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import type { ObjectId, ProvenanceRecord } from "../../protocol/src/model";
+import type { ObjectId, ProvenanceRecord } from "@javelin/protocol";
 import { recordRun } from "@javelin/provenance";
 import type { Repository } from "@javelin/vcs";
 

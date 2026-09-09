@@ -1,4 +1,4 @@
-import type { EvidenceRecord, ObjectId } from "../../protocol/src/model";
+import type { EvidenceRecord, ObjectId } from "@javelin/protocol";
 import type { Repository } from "@javelin/vcs";
 
 export interface RequiredEvidence {

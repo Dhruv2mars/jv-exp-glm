@@ -8,7 +8,7 @@ import { JavelinClient } from "../packages/sdk/src/index";
 import { importFromGit } from "../packages/git-bridge/src/index";
 import { openRepository } from "../packages/vcs/src/index";
 import { objectId } from "../packages/protocol/src/index";
-import { recordProvenance } from "../packages/provenance/src/index";
+import { recordRun } from "../packages/provenance/src/index";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const CLI = join(REPO_ROOT, "apps", "cli", "src", "main.ts");
@@ -52,10 +52,10 @@ async function git(cwd: string, args: string[]): Promise<string> {
 }
 
 describe("platform end to end", () => {
-  let headId: string;
-  let commitViaCliId: string;
+  let worldAfterSeed: string;
+  let stateViaCliId: ReturnType<typeof objectId> | undefined;
 
-  test("git repo imports via git-bridge into javelind", async () => {
+  test("git repo imports via git-bridge into javelind as World", async () => {
     await client.createRepo({ name: "app", description: "e2e repo" });
     const gitDir = join(work, "seed-git");
     mkdirSync(gitDir, { recursive: true });
@@ -69,93 +69,95 @@ describe("platform end to end", () => {
     await git(gitDir, ["commit", "-m", "seed: add readme and util"]);
     const result = await importFromGit(gitDir, join(work, "javelind-root", "app"));
     expect(result.warnings).toEqual([]);
-    expect(result.commits).toBe(1);
-    headId = result.refs["refs/heads/main"]!;
-    expect(headId).toBeDefined();
+    expect(result.counts.states).toBe(1);
+    worldAfterSeed = (await client.getHeads("app")).world!;
+    expect(worldAfterSeed).toBeDefined();
   });
 
-  test("CLI clones, commits, pushes; second clone pulls", async () => {
+  test("CLI clones, checkpoints a layer, publishes; second clone pulls the new World", async () => {
     const cloneA = join(work, "clone-a");
     const cloneB = join(work, "clone-b");
-    const cloneA2 = await run(["clone", `${javelindUrl}/app`, cloneA], work);
-    expect(cloneA2.code).toBe(0);
-    const cloneB2 = await run(["clone", `${javelindUrl}/app`, cloneB], work);
-    expect(cloneB2.code).toBe(0);
+    expect((await run(["clone", `${javelindUrl}/app`, cloneA], work)).code).toBe(0);
+    expect((await run(["clone", `${javelindUrl}/app`, cloneB], work)).code).toBe(0);
     expect(await Bun.file(join(cloneA, "src", "util.ts")).text()).toContain("greet");
 
+    expect((await run(["layer", "new", "cli-work"], cloneA)).code).toBe(0);
     writeFileSync(join(cloneA, "src", "extra.txt"), "pushed via cli\n");
-    const add = await run(["add", "."], cloneA);
-    expect(add.code).toBe(0);
-    const commit = await run(["commit", "-m", "cli: add extra file"], cloneA);
-    expect(commit.code).toBe(0);
-    const push = await run(["push", "origin"], cloneA);
-    expect(push.code).toBe(0);
+    expect((await run(["checkpoint", "-m", "cli: add extra file"], cloneA)).code).toBe(0);
+    const contributed = await run(["contribute", "-t", "cli change"], cloneA);
+    expect(contributed.code).toBe(0);
+    const contributionId = contributed.stdout.match(/[0-9a-f]{64}/)![0];
+    const published = await run(["publish", contributionId], cloneA);
+    expect(published.code).toBe(0);
+    expect(published.stdout).toContain("published");
 
-    const pull = await run(["pull", "origin"], cloneB);
+    const pull = await run(["pull"], cloneB);
     expect(pull.code).toBe(0);
     expect(await Bun.file(join(cloneB, "src", "extra.txt")).text()).toContain("pushed via cli");
 
-    const refs = (await client.listRefs("app")).refs;
-    commitViaCliId = refs["refs/heads/main"]!;
-    expect(commitViaCliId).not.toBe(headId);
+    stateViaCliId = objectId((await run(["status"], cloneB)).stdout.match(/world: ([0-9a-f]{64})/)![1]!);
+    const log = await client.statesLog("app", { start: stateViaCliId!, limit: 10 });
+    expect(log.entries.some((s) => s.message.includes("cli: add extra file"))).toBe(true);
   });
 
   test("SDK searches code and history", async () => {
-    const code = await client.search("app", "greet", { kind: "code" });
+    const code = await client.search("app", { query: "greet", kind: "code" });
     expect(code.hits.length).toBeGreaterThan(0);
     expect(code.hits[0]!.kind).toBe("code");
-    const history = await client.search("app", "cli: add extra file", { kind: "history" });
+    const history = await client.search("app", { query: "cli: add extra file", kind: "history" });
     expect(history.hits.length).toBeGreaterThan(0);
-    expect(String(history.hits[0]!.commit)).toBe(commitViaCliId);
   });
 
-  test("provenance recorded on a commit is searchable", async () => {
+  test("provenance recorded against a published state is searchable", async () => {
     const repo = await openRepository(join(work, "javelind-root", "app"));
-    const result = await recordProvenance(repo, objectId(commitViaCliId), {
-      kind: "provenance",
+    await recordRun(repo, {
+      states: [objectId(stateViaCliId!)],
       agent: { name: "e2e-bot", adapter: "generic" },
       startedAt: new Date().toISOString(),
       exit: "success",
       summary: "ran the e2e scenario",
     });
-    expect(result.attached).toBe(true);
-    const refs = (await client.listRefs("app")).refs;
-    commitViaCliId = refs["refs/heads/main"]!;
-    const prov = await client.search("app", "e2e-bot", { kind: "provenance" });
+    const prov = await client.search("app", { query: "e2e-bot", kind: "provenance" });
     expect(prov.hits.length).toBeGreaterThan(0);
   });
 
-  test("web renders home, repo, commits, commit, and browse pages", async () => {
+  test("web renders home, repo, world log, state, browse, and blob pages", async () => {
     const home = await (await fetch(webUrl)).text();
     expect(home).toContain("app");
     const repoPage = await (await fetch(`${webUrl}/app`)).text();
-    expect(repoPage).toContain("Browse files");
-    const commits = await (await fetch(`${webUrl}/app/commits`)).text();
-    expect(commits).toContain("cli: add extra file");
-    const commitPage = await (await fetch(`${webUrl}/app/commit/${commitViaCliId}`)).text();
-    expect(commitPage).toContain("cli: add extra file");
-    const browse = await (await fetch(`${webUrl}/app/browse/main`)).text();
+    expect(repoPage).toContain("app");
+    const world = await (await fetch(`${webUrl}/app/world`)).text();
+    expect(world).toContain("cli: add extra file");
+    const statePage = await (await fetch(`${webUrl}/app/state/${stateViaCliId}`)).text();
+    expect(statePage).toContain("publish cli-work: cli change");
+    expect(statePage).toContain("Changed files");
+    const browse = await (await fetch(`${webUrl}/app/browse/world`)).text();
     expect(browse).toContain("README.md");
-    const blob = await (await fetch(`${webUrl}/app/blob/main/src/util.ts`)).text();
+    expect(browse).toContain("/app/browse/world/src");
+    const srcPage = await (await fetch(`${webUrl}/app/browse/world/src`)).text();
+    const blobLink = srcPage.match(/href="(\/app\/blob\/[0-9a-f]{64}\/src\/util\.ts)"/);
+    expect(blobLink).not.toBeNull();
+    const blob = await (await fetch(`${webUrl}${blobLink![1]}`)).text();
     expect(blob).toContain("greet");
   });
 
   test("backup and restore preserve the served state", async () => {
     const root = join(work, "javelind-root");
-    const refsBefore = (await client.listRefs("app")).refs;
-    const logBefore = await client.log("app", refsBefore["refs/heads/main"]!, 10);
+    const headsBefore = await client.getHeads("app");
+    const logBefore = await client.statesLog("app", { start: headsBefore.world!, limit: 10 });
 
     const { backupRoot } = await import("./backup");
     const { restoreRoot } = await import("./restore");
     const { archivePath } = await backupRoot(root, join(work, "archive"));
     rmSync(root, { recursive: true, force: true });
-    await expect(client.listRefs("app")).rejects.toThrow();
+    await expect(client.getHeads("app")).rejects.toThrow();
     const repos = await restoreRoot(archivePath, root);
     expect(repos).toEqual(["app"]);
 
-    expect((await client.listRefs("app")).refs).toEqual(refsBefore);
-    expect(await client.log("app", refsBefore["refs/heads/main"]!, 10)).toEqual(logBefore);
-    const page = await (await fetch(`${webUrl}/app/commits`)).text();
+    const headsAfter = await client.getHeads("app");
+    expect(headsAfter.world).toBe(headsBefore.world);
+    expect(await client.statesLog("app", { start: headsBefore.world!, limit: 10 })).toEqual(logBefore);
+    const page = await (await fetch(`${webUrl}/app/world`)).text();
     expect(page).toContain("cli: add extra file");
   });
 });

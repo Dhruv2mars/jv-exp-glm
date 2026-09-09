@@ -66,7 +66,7 @@ import type {
   HeadsView,
   LayerRef,
   ProvenanceRecord,
-} from "../../../packages/protocol/src/model";
+} from "@javelin/protocol";
 
 export interface JavelindOptions {
   port?: number;
