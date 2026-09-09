@@ -183,6 +183,9 @@ export class Repository {
 
   async layerNew(name: string): Promise<LayerRef> {
     if (!LAYER_NAME_RE.test(name)) throw new Error(`invalid layer name: ${name}`);
+    if (name === "world" || name === "current" || name.endsWith(".lock")) {
+      throw new Error(`reserved layer name: ${name}`);
+    }
     const world = await this.worldHead();
     if (!world) throw new Error("world head missing; run init first");
     const ref: LayerRef = { name, base: world, head: null, updatedAt: now() };

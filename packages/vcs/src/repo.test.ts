@@ -570,15 +570,18 @@ describe("Repository v2", () => {
     await expect(repo.layerNew("ok-name")).resolves.toBeDefined();
   });
 
-  test("a layer named notes.lock is listed and stays gc-reachable", async () => {
+  test("a legacy notes.lock layer key is listed and stays gc-reachable", async () => {
     const repo = await init(root);
     await publishEdit(repo, "seed", "seed", async () => {
       await writeFile(join(root, "a.txt"), "a\n");
     });
-    const cp = await forkAndCheckpoint(repo, "notes.lock", "scratch", async () => {
+    const cp = await forkAndCheckpoint(repo, "tmp", "scratch", async () => {
       await writeFile(join(root, "scratch.txt"), "scratch\n");
     });
-    expect((await repo.layerList()).map((ref) => ref.name)).toContain("notes.lock");
+    const ref = { ...(await repo.layerGet("tmp"))!, name: "notes.lock" };
+    expect(await repo.meta.create("layer/notes.lock", JSON.stringify(ref))).toBe(true);
+    await repo.layerDiscard("tmp");
+    expect((await repo.layerList()).map((entry) => entry.name)).toContain("notes.lock");
 
     const state = await repo.loadState(cp);
     const tree = await repo.loadTree(state.tree);

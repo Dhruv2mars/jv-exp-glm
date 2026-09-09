@@ -46,6 +46,10 @@ export class MetaStore {
     return join(this.dir, ...key.split("/"));
   }
 
+  private lockPath(key: string): string {
+    return join(this.dir, ".locks", `${encodeURIComponent(key)}.lock`);
+  }
+
   async get(key: string): Promise<string | null> {
     const path = this.filePath(key);
     try {
@@ -90,7 +94,7 @@ export class MetaStore {
         return;
       }
       for (const name of entries.sort()) {
-        if (name.endsWith(".lock") || name.startsWith(".tmp-")) continue;
+        if (name === ".locks" || name.startsWith(".tmp-")) continue;
         const parts = [...rel, name];
         if ((await stat(join(this.dir, ...parts))).isDirectory()) await walk(parts);
         else keys.push(parts.join("/"));
@@ -101,7 +105,7 @@ export class MetaStore {
   }
 
   private async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    const lockPath = this.filePath(key) + ".lock";
+    const lockPath = this.lockPath(key);
     await mkdir(dirname(lockPath), { recursive: true });
     const token = crypto.randomUUID();
     const deadline = Date.now() + this.lockTimeoutMs;

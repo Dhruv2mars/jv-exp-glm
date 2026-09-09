@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { MetaStore } from "./meta";
 
 let dir: string;
 let metaDir: string;
-const lockPath = () => join(metaDir, "k.lock");
+const lockPath = () => join(metaDir, ".locks", "k.lock");
 
 function locker(store: MetaStore): { withLock: (key: string, fn: () => Promise<string>) => Promise<string> } {
   return store as unknown as { withLock: (key: string, fn: () => Promise<string>) => Promise<string> };
@@ -101,7 +101,8 @@ describe("MetaStore", () => {
 
   test("a stale lock is stolen after the mtime threshold", async () => {
     const store = new MetaStore(metaDir);
-    const lockPath = join(metaDir, "k.lock");
+    const lockPath = join(metaDir, ".locks", "k.lock");
+    await mkdir(dirname(lockPath), { recursive: true });
     await writeFile(lockPath, "pid:crashed");
     const backdated = new Date(Date.now() - 11_000);
     await utimes(lockPath, backdated, backdated);
@@ -111,12 +112,15 @@ describe("MetaStore", () => {
 
   test("a fresh lock blocks until the timeout", async () => {
     const store = new MetaStore(metaDir, { lockTimeoutMs: 300 });
-    await writeFile(join(metaDir, "k.lock"), "pid:live");
+    const lockPath = join(metaDir, ".locks", "k.lock");
+    await mkdir(dirname(lockPath), { recursive: true });
+    await writeFile(lockPath, "pid:live");
     await expect(store.create("k", "v")).rejects.toThrow("meta lock timeout: k");
     expect(await store.get("k")).toBeNull();
   });
 
-  test("two real bun processes race one CAS key; exactly one winner per round", async () => {    const store = new MetaStore(metaDir);
+  test("two real bun processes race one CAS key; exactly one winner per round", async () => {
+    const store = new MetaStore(metaDir);
     const workerPath = join(dir, "cas-worker.ts");
     const src = `
 import { MetaStore } from ${JSON.stringify(join(import.meta.dir, "meta.ts"))};
