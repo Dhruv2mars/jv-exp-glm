@@ -361,6 +361,15 @@ export class Repository {
       if (!moved.ok) return this.publishFailure("status-moved");
       return { ok: true, idempotent: false, worldState: world, reason: null, conflicts: [] };
     }
+    if (await this.isAncestorOrSelf(contribution.state, world)) {
+      const event: ContributionEvent = { status: "published", at: now(), by: author.name, worldState: world };
+      await this.meta.compareAndSwap(
+        key,
+        raw,
+        JSON.stringify({ ...cmeta, status: "published", events: [...cmeta.events, event] } satisfies ContributionMeta),
+      );
+      return { ok: true, idempotent: true, worldState: world, reason: null, conflicts: [] };
+    }
     const base =
       (await this.isAncestorOrSelf(contribution.base, world))
         ? contribution.base
@@ -384,7 +393,15 @@ export class Repository {
       raw,
       JSON.stringify({ ...cmeta, status: "published", events: [...cmeta.events, event] } satisfies ContributionMeta),
     );
-    if (!statusMoved.ok) return this.publishFailure("status-moved");
+    if (!statusMoved.ok) {
+      const current = await this.meta.get(key);
+      const latest = current ? (JSON.parse(current) as ContributionMeta) : null;
+      const published = latest ? [...latest.events].reverse().find((e) => e.status === "published") : null;
+      if (latest?.status === "published" && published?.worldState === id) {
+        return { ok: true, idempotent: true, worldState: id, reason: null, conflicts: [] };
+      }
+      return this.publishFailure("status-moved");
+    }
     return { ok: true, idempotent: false, worldState: id, reason: null, conflicts: [] };
   }
 
