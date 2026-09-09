@@ -25,3 +25,37 @@ describe("protocol", () => {
     expect(commit.parents).toHaveLength(0);
   });
 });
+
+import { type State, type ProvenanceRecord, type Contribution, type LayerRef } from "./model";
+
+describe("model v2", () => {
+  test("state and provenance shapes serialize", () => {
+    const id = objectId("c".repeat(64));
+    const state: State = {
+      kind: "state",
+      tree: id,
+      parents: [],
+      author: { name: "a", email: "a@x", time: new Date(0).toISOString() },
+      message: "checkpoint",
+    };
+    const prov: ProvenanceRecord = {
+      kind: "provenance",
+      states: [id],
+      agent: { name: "codex", adapter: "codex" },
+      startedAt: new Date(0).toISOString(),
+    };
+    expect(JSON.parse(JSON.stringify(prov)).states[0]).toBe(id);
+    const contrib: Contribution = {
+      kind: "contribution",
+      layer: "fix-bug",
+      state: id,
+      base: id,
+      title: "Fix bug",
+      author: state.author,
+      createdAt: new Date(0).toISOString(),
+    };
+    const layer: LayerRef = { name: "fix-bug", base: id, head: null, updatedAt: new Date(0).toISOString() };
+    expect(layer.head).toBeNull();
+    expect(contrib.state).toBe(id);
+  });
+});
