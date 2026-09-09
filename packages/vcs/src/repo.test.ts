@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, utimes, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ObjectId } from "../../protocol/src/model";
-import { init, openRepository, Repository, type Author, type FileMap, type MergeConflict, type PublishResult } from "./repo";
+import { init, openRepository, Repository, type Author, type ContributionMeta, type FileMap, type MergeConflict, type PublishResult } from "./repo";
 import { ObjectStore } from "./store";
 
 const AUTHOR: Author = { name: "agent", email: "agent@javelin.dev" };
@@ -455,6 +455,85 @@ describe("Repository v2", () => {
     const fsck = await repo.fsck();
     expect(fsck.ok).toBe(true);
     expect(fsck.unreachable).not.toContain(liveHead);
+  });
+
+  test("publish retry after a crash between world CAS and status CAS does not duplicate a commit", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "file.txt"), "x\ny\n");
+    });
+    await forkAndCheckpoint(repo, "crashy", "add file", async () => {
+      await writeFile(join(root, "added.txt"), "added\n");
+    });
+    const contribId = await repo.contribute("crashy", "add a file", AUTHOR);
+
+    class CrashyRepo extends Repository {
+      crashed = false;
+      constructor() {
+        super(root, join(root, ".javelin"));
+      }
+      protected override async casWorld(expectedRaw: string, next: ObjectId): Promise<boolean> {
+        const moved = await super.casWorld(expectedRaw, next);
+        if (moved && !this.crashed) {
+          this.crashed = true;
+          throw new Error("crash: died between world CAS and status CAS");
+        }
+        return moved;
+      }
+    }
+    const crashy = new CrashyRepo();
+    await expect(crashy.publish(contribId, AUTHOR)).rejects.toThrow("crash");
+    const worldAfterCrash = await repo.worldHead();
+    const logLengthAfterCrash = (await repo.worldLog(10)).length;
+
+    const retry = await repo.publish(contribId, AUTHOR);
+    expect(retry.ok).toBe(true);
+    expect(retry.idempotent).toBe(true);
+    expect(retry.worldState).toBe(worldAfterCrash);
+    expect(await repo.worldHead()).toBe(worldAfterCrash);
+    expect(await repo.worldLog(10)).toHaveLength(logLengthAfterCrash);
+  });
+
+  test("a status CAS lost to an identical published record is an idempotent success", async () => {
+    const repo = await init(root);
+    await publishEdit(repo, "seed", "seed", async () => {
+      await writeFile(join(root, "file.txt"), "x\n");
+    });
+    await forkAndCheckpoint(repo, "racy", "add file", async () => {
+      await writeFile(join(root, "added.txt"), "added\n");
+    });
+    const contribId = await repo.contribute("racy", "add a file", AUTHOR);
+
+    class RacerRepo extends Repository {
+      constructor() {
+        super(root, join(root, ".javelin"));
+      }
+      protected override async casWorld(expectedRaw: string, next: ObjectId): Promise<boolean> {
+        const moved = await super.casWorld(expectedRaw, next);
+        if (moved) {
+          const raw = await this.meta.get(`contrib/${contribId}`);
+          const cmeta = JSON.parse(raw!) as ContributionMeta;
+          await this.meta.compareAndSwap(
+            `contrib/${contribId}`,
+            raw!,
+            JSON.stringify({
+              ...cmeta,
+              status: "published",
+              events: [...cmeta.events, { status: "published", at: new Date().toISOString(), by: "racer", worldState: next }],
+            }),
+          );
+        }
+        return moved;
+      }
+    }
+    const racer = new RacerRepo();
+    const result = await racer.publish(contribId, AUTHOR);
+    expect(result.ok).toBe(true);
+    expect(result.idempotent).toBe(true);
+    expect(result.worldState).toBe(await repo.worldHead());
+
+    const stored = (await repo.contribution(contribId))!;
+    expect(stored.meta.events.filter((event) => event.status === "published")).toHaveLength(1);
   });
 
   test("provenance and evidence are append-only references", async () => {
