@@ -173,15 +173,19 @@ export class Repo {
     return this.store.put('context-root', cborEncode(record))
   }
 
-  history(limit?: number): WorldVersionRecord[] {
-    const out: WorldVersionRecord[] = []
+  historyEntries(limit?: number): Array<{ id: string; record: WorldVersionRecord }> {
+    const out: Array<{ id: string; record: WorldVersionRecord }> = []
     let ref: string | null = this.worldRef().data.head
     while (ref && (limit === undefined || out.length < limit)) {
       const record = this.worldRecord(ref)
-      out.push(record)
+      out.push({ id: ref, record })
       ref = record.parent
     }
     return out
+  }
+
+  history(limit?: number): WorldVersionRecord[] {
+    return this.historyEntries(limit).map((e) => e.record)
   }
 
   // ---- layers ----
