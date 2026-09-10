@@ -1,6 +1,6 @@
 {
   "name": "jv-cli-exp",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "bin": {
     "javelin": "src/cli/main.ts",
     "jv": "src/cli/main.ts"
@@ -31,7 +31,8 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Dhruv2mars/jv-exp-glm.git"
+    "url": "git+https://github.com/Dhruv2mars/jv-exp-glm.git",
+    "directory": "."
   },
   "keywords": [
     "vcs",
@@ -40,5 +41,8 @@
     "cli",
     "javelin"
   ],
-  "prepublishOnly": "bun test"
+  "prepublishOnly": "bun test",
+  "publishConfig": {
+    "access": "public"
+  }
 }
