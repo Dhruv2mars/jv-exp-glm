@@ -1,14 +1,44 @@
 {
-  "name": "javelin",
-  "private": true,
-  "workspaces": ["packages/*", "apps/*"],
+  "name": "jv-cli-exp",
+  "version": "0.1.0",
+  "bin": {
+    "javelin": "src/cli/main.ts",
+    "jv": "src/cli/main.ts"
+  },
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "build": "bun run ./scripts/build.ts"
+    "javelin": "bun run src/cli/main.ts",
+    "publish": "npm publish"
+  },
+  "dependencies": {
+    "hash-wasm": "^4.12.0"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
     "typescript": "^7.0.2"
-  }
+  },
+  "description": "javelin-cli: an agent-native, local-first version control system (experimental)",
+  "files": [
+    "src",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "bun": ">=1.3"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dhruv2mars/jv-exp-glm.git"
+  },
+  "keywords": [
+    "vcs",
+    "version-control",
+    "agents",
+    "cli",
+    "javelin"
+  ],
+  "prepublishOnly": "bun test"
 }
