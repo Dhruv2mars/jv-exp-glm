@@ -26,9 +26,21 @@ Context  agent work carries its native trace, sealed together with the code.
 
 There is no staging area and no partial publish. To ship part of a layer, clone it, delete what stays behind, and publish the clone. To combine work, stack layers into one and publish that.
 
+## Install
+
+Requires [Bun](https://bun.sh).
+
+```sh
+npm install -g jv-cli-exp
+```
+
+That installs two identical binaries, `javelin` and the short form `jv`. Source checkout instead: `bun install` in this repo and run `bun run src/cli/main.ts`.
+
+One boundary to know up front: `javelin init` refuses to run inside a Git repository. Javelin is a clean alternative, not a layer on top of Git, and carrying two histories in one folder is a trap.
+
 ## Quickstart
 
-You need [Bun](https://bun.sh). Every command below was run against this commit.
+Every command below was run against this commit.
 
 First, version an existing folder:
 
@@ -71,6 +83,10 @@ bun run src/cli/main.ts verify --full
 
 Automation should append `--json` to every command. Output is a versioned envelope with stable error codes, and mutating commands accept `--operation-id` so a retried publish cannot create two versions.
 
+Maintenance commands: `javelin gc` reclaims objects no root references (it never touches anything newer than the grace window), `javelin doctor` repairs what is safe and reports what is not, `javelin verify --full` re-hashes the repository. Captured traces are scanned for obvious credentials and refused unless `--allow-secrets` is explicit; your adapter still owns real sanitization.
+
+Javelin is local-only by design for now. Synchronization and hosting are the second stage of the project.
+
 ## Design
 
 [docs/DESIGN.md](docs/DESIGN.md) explains the frozen architecture: World versions, Layer storage, the composition engine shared by stack and publish, conflict semantics, agent context, and the reliability contract.
@@ -87,4 +103,4 @@ The test suite covers every core module, drives the real binary end to end again
 
 ## Status
 
-javelin-cli is the first stage of the Javelin project. The workspace projection that materializes layers is a documented fallback (full clone on create) while the sparse macOS backend is benchmarked; the canonical storage is overlay-only either way. The second stage, Javelin hosting, is out of scope here.
+javelin-cli is the first stage of the Javelin project. The architecture targets one hundred concurrent layers on a developer machine; the benchmark suite for that target is designed and waiting on suitable hardware, so treat the target as declared, not measured. Layers materialize through APFS copy-on-write clones from a template cache today, and seal scans are stat-indexed. The second stage, Javelin hosting, is out of scope here.
