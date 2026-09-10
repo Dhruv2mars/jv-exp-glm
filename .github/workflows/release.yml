@@ -84,6 +84,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: use npm with trusted publishing support
+        run: npm install -g npm@11.11.1
       - name: publish with trusted publishing
         run: |
           set -euo pipefail
