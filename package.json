@@ -8,8 +8,7 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "javelin": "bun run src/cli/main.ts",
-    "publish": "npm publish"
+    "javelin": "bun run src/cli/main.ts"
   },
   "dependencies": {
     "hash-wasm": "^4.12.0"
