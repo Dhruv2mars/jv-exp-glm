@@ -1,6 +1,6 @@
 {
   "name": "jv-cli-exp",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "bin": {
     "javelin": "src/cli/main.ts",
     "jv": "src/cli/main.ts"
