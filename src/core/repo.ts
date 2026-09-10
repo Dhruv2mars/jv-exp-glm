@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, statSync, lstatSync, rmSync, writeFileSync, symlinkSync, chmodSync, renameSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, statSync, lstatSync, rmSync, rmdirSync, writeFileSync, symlinkSync, chmodSync, renameSync } from 'node:fs'
 
 // existsSync follows symlinks and reports a broken link as absent, which
 // makes seal oscillate between storing and deleting it. lstat looks at the
@@ -21,9 +21,18 @@ import { compose, type Conflict } from './compose.ts'
 import { Refs, CasConflict } from './refs.ts'
 import { Timeline } from './timeline.ts'
 import { IgnoreRules, translateGitignore } from './ignore.ts'
+import { scanTraceForSecrets } from './secrets.ts'
 import { validatePath, assertNoCollisions } from './paths.ts'
 
 export type Change = { kind: FileKind; oid: Oid } | null
+
+interface StatIndexEntry {
+  m: number
+  s: number
+  i: number
+  kind: FileKind
+  oid: string
+}
 
 export interface WorldRefData {
   v: 1
@@ -103,6 +112,21 @@ export class RepositoryError extends Error {
 
 const LATEST_SCAN_LIMIT = 16
 const OP_STALE_MS = 30_000
+const TEMPLATE_CACHE_SIZE = 4
+
+// Directory copy that uses APFS clonefile (cp -c) when available, so a
+// materialized workspace shares blocks with its template until edited.
+// Falls back to a plain copy everywhere else or when cloning fails.
+function copyTree(src: string, dest: string): void {
+  const args = process.platform === 'darwin' ? ['-Rc', '-p'] : ['-R', '-p']
+  let result = Bun.spawnSync(['cp', ...args, src, dest], { stdout: 'pipe', stderr: 'pipe' })
+  if (result.exitCode !== 0 && args[0] === '-Rc') {
+    result = Bun.spawnSync(['cp', '-R', '-p', src, dest], { stdout: 'pipe', stderr: 'pipe' })
+  }
+  if (result.exitCode !== 0) {
+    throw new RepositoryError('error', `failed to materialize ${dest}: ${result.stderr.toString().trim()}`)
+  }
+}
 
 function pidAlive(pid: number): boolean {
   try {
@@ -141,6 +165,12 @@ export class Repo {
     const metaDir = join(projectDir, '.javelin')
     if (existsSync(metaDir)) {
       throw new RepositoryError('already-a-repository', `${projectDir} already has a .javelin`)
+    }
+    if (existsSync(join(projectDir, '.git'))) {
+      throw new RepositoryError(
+        'git-repository',
+        `${projectDir} is a Git repository; javelin is a clean alternative, not a layer on top of it. Remove .git or init a different folder.`,
+      )
     }
     mkdirSync(join(metaDir, 'objects'), { recursive: true })
     mkdirSync(join(metaDir, 'refs'), { recursive: true })
@@ -314,6 +344,7 @@ export class Repo {
     }
     rmSync(this.refsPathForLayer(name), { force: true })
     rmSync(this.workspacePath(name), { recursive: true, force: true })
+    rmSync(this.statIndexPath(name), { force: true })
     this.timeline.append('layer.deleted', { layer: name })
   }
 
@@ -335,8 +366,10 @@ export class Repo {
     const tracked = this.trees.listFiles(trackedTree)
     const workspace = this.workspacePath(name)
     const changes: Map<string, Change> = new Map()
+    const index = this.loadStatIndex(name)
     if (existsSync(workspace)) {
-      this.scanInto(workspace, '', tracked, IgnoreRules.load(this.projectDir), changes)
+      this.scanInto(workspace, '', tracked, IgnoreRules.load(this.projectDir), changes, index)
+      this.saveStatIndex(name, index)
     }
     // Paths tracked but absent from the workspace were deleted.
     for (const path of tracked.keys()) {
@@ -367,8 +400,10 @@ export class Repo {
     const trackedTree = Oid.parse(record.savedRoot ?? record.baseTree)
     const tracked = this.trees.listFiles(trackedTree)
     const changes: Map<string, Change> = new Map()
+    const index = this.loadStatIndex(name)
     if (existsSync(workspace)) {
-      this.scanInto(workspace, '', tracked, IgnoreRules.load(this.projectDir), changes)
+      this.scanInto(workspace, '', tracked, IgnoreRules.load(this.projectDir), changes, index)
+      this.saveStatIndex(name, index)
     }
     const missing = [...tracked.keys()].filter((p) => !pathPresent(join(workspace, p)))
     return {
@@ -633,19 +668,39 @@ export class Repo {
     return updated
   }
 
-  sessionTrace(sessionId: string, tracePath: string): LayerRecord {
-    const { layerName, record } = this.findSession(sessionId)
-    const chunk = this.store.put('trace-chunk', new Uint8Array(readFileSync(tracePath)))
-    const updated = this.updateLayer(layerName, (d) => ({ ...d, chunks: [...d.chunks, chunk.ref] }))
-    void record
-    return updated
+  sessionTrace(sessionId: string, tracePath: string, opts?: { allowSecrets?: boolean }): LayerRecord {
+    const bytes = new Uint8Array(readFileSync(tracePath))
+    const findings = scanTraceForSecrets(bytes)
+    if (findings.length > 0 && opts?.allowSecrets !== true) {
+      throw new RepositoryError(
+        'trace-secrets',
+        `${tracePath} looks like it contains credentials; pass --allow-secrets to store it anyway`,
+        { findings },
+      )
+    }
+    const { layerName } = this.findSession(sessionId)
+    const chunk = this.store.put('trace-chunk', bytes)
+    return this.updateLayer(layerName, (d) => ({ ...d, chunks: [...d.chunks, chunk.ref] }))
   }
 
-  sessionSubtask(sessionId: string, subtask: { taskId: string; agentType: string; tracePath?: string; childLayer?: string }): LayerRecord {
+  sessionSubtask(
+    sessionId: string,
+    subtask: { taskId: string; agentType: string; tracePath?: string; childLayer?: string; allowSecrets?: boolean },
+  ): LayerRecord {
     const { layerName } = this.findSession(sessionId)
-    const chunks = subtask.tracePath
-      ? [this.store.put('trace-chunk', new Uint8Array(readFileSync(subtask.tracePath))).ref]
-      : []
+    let chunks: string[] = []
+    if (subtask.tracePath) {
+      const bytes = new Uint8Array(readFileSync(subtask.tracePath))
+      const findings = scanTraceForSecrets(bytes)
+      if (findings.length > 0 && subtask.allowSecrets !== true) {
+        throw new RepositoryError(
+          'trace-secrets',
+          `${subtask.tracePath} looks like it contains credentials; pass --allow-secrets to store it anyway`,
+          { findings },
+        )
+      }
+      chunks = [this.store.put('trace-chunk', bytes).ref]
+    }
     return this.updateLayer(layerName, (d) => ({
       ...d,
       subtasks: [
@@ -781,12 +836,18 @@ export class Repo {
   // Walks a workspace directory and fills `changes` with everything that
   // differs from the tracked state. Untracked paths matching ignore rules
   // are skipped; tracked paths are never dropped by rules.
+  //
+  // The stat index maps each scanned path to the mtime, size, inode, and
+  // content id seen at the last scan. A file whose signature is unchanged
+  // reuses the recorded id without reading or hashing bytes, so seal and
+  // status cost follows edited files, not the size of the World.
   private scanInto(
     dir: string,
     prefix: string,
     tracked: Map<string, TreeEntry>,
     ignore: IgnoreRules,
     changes: Map<string, Change>,
+    index?: { read: Map<string, StatIndexEntry>; write: Map<string, StatIndexEntry> },
   ): void {
     const trackedDirs = new Set<string>()
     for (const path of tracked.keys()) {
@@ -801,7 +862,7 @@ export class Repo {
       if (entry.name === '.javelin') continue
       if (entry.isDirectory()) {
         if (!trackedDirs.has(path) && ignore.matched(path, true)) continue
-        this.scanInto(join(dir, entry.name), `${path}/`, tracked, ignore, changes)
+        this.scanInto(join(dir, entry.name), `${path}/`, tracked, ignore, changes, index)
         continue
       }
       validatePath(path)
@@ -815,17 +876,69 @@ export class Repo {
         continue
       }
       if (!entry.isFile()) continue
-      const bytes = new Uint8Array(readFileSync(join(dir, entry.name)))
-      const kind: FileKind = (statSync(join(dir, entry.name)).mode & 0o111) !== 0 ? 'exec' : 'file'
-      const oid = this.trees.putBlob(bytes)
+      const full = join(dir, entry.name)
+      const st = statSync(full)
+      const cached = index?.read.get(path)
+      let kind: FileKind
+      let oid: Oid
+      if (cached && cached.m === st.mtimeMs && cached.s === st.size && cached.i === st.ino) {
+        kind = cached.kind
+        oid = Oid.parse(cached.oid)
+        index?.write.set(path, cached)
+      } else {
+        kind = (st.mode & 0o111) !== 0 ? 'exec' : 'file'
+        oid = this.trees.putBlob(new Uint8Array(readFileSync(full)))
+        index?.write.set(path, { m: st.mtimeMs, s: st.size, i: st.ino, kind, oid: oid.ref })
+      }
       if (!known || known.kind !== kind || !known.oid.equals(oid)) {
         changes.set(path, { kind, oid })
       }
     }
   }
 
+  private statIndexPath(name: string): string {
+    return join(this.metaDir, 'workspaces', `${name}.index`)
+  }
+
+  private loadStatIndex(name: string): {
+    read: Map<string, StatIndexEntry>
+    write: Map<string, StatIndexEntry>
+  } {
+    const path = this.statIndexPath(name)
+    const read = new Map<string, StatIndexEntry>()
+    if (existsSync(path)) {
+      try {
+        const body = JSON.parse(readFileSync(path, 'utf8')) as Record<string, StatIndexEntry>
+        for (const [k, v] of Object.entries(body)) read.set(k, v)
+      } catch {
+        // a torn index is a cache miss, never an error
+      }
+    }
+    return { read, write: new Map() }
+  }
+
+  private saveStatIndex(name: string, index: { write: Map<string, StatIndexEntry> }): void {
+    const path = this.statIndexPath(name)
+    const body: Record<string, StatIndexEntry> = {}
+    for (const [k, v] of index.write) body[k] = v
+    const tmp = `${path}.tmp-${process.pid}-${Date.now()}`
+    writeFileSync(tmp, JSON.stringify(body))
+    renameSync(tmp, path)
+  }
+
+  // Workspaces materialize from a template cache. The first materialization
+  // of a given tree writes every file once and keeps the result under
+  // .javelin/cache/trees; every later materialization of that tree is a
+  // copy-on-write clone of the template, so per-layer cost drops from a full
+  // copy to near zero. Templates are replaceable cache, not canonical state.
   private materializeWorkspace(name: string, treeId: Oid): void {
     const dest = this.workspacePath(name)
+    rmSync(dest, { recursive: true, force: true })
+    const template = this.templatePath(treeId)
+    if (existsSync(template)) {
+      copyTree(template, dest)
+      return
+    }
     const staging = `${dest}.staging-${process.pid}-${Date.now()}`
     rmSync(staging, { recursive: true, force: true })
     mkdirSync(staging, { recursive: true })
@@ -840,8 +953,189 @@ export class Repo {
       writeFileSync(target, this.trees.readBlob(entry.oid))
       if (entry.kind === 'exec') chmodSync(target, 0o755)
     }
-    rmSync(dest, { recursive: true, force: true })
-    renameSync(staging, dest)
+    mkdirSync(dirname(template), { recursive: true })
+    const templateTmp = `${template}.tmp-${process.pid}-${Date.now()}`
+    copyTree(staging, templateTmp)
+    renameSync(templateTmp, template)
+    rmSync(staging, { recursive: true, force: true })
+    copyTree(template, dest)
+    this.pruneTemplates(treeId)
+  }
+
+  private templatePath(treeId: Oid): string {
+    return join(this.metaDir, 'cache', 'trees', treeId.hex)
+  }
+
+  // Keep a handful of recent templates; older ones are rebuildable on demand.
+  private pruneTemplates(keep: Oid): void {
+    const dir = join(this.metaDir, 'cache', 'trees')
+    if (!existsSync(dir)) return
+    const entries = readdirSync(dir)
+      .filter((n) => n !== keep.hex && !n.includes('.tmp-'))
+      .map((n) => ({ n, at: statSync(join(dir, n)).mtimeMs }))
+      .sort((a, b) => b.at - a.at)
+    for (const entry of entries.slice(TEMPLATE_CACHE_SIZE)) {
+      rmSync(join(dir, entry.n), { recursive: true, force: true })
+    }
+  }
+
+  // Rebuild a layer's workspace folder when it is missing (crash during a
+  // materialization swap, manual deletion). The durable state is untouched.
+  ensureWorkspace(name: string): string {
+    const record = this.layer(name)
+    if (record.status === 'published') {
+      throw new RepositoryError('published', `layer ${name} is published and read-only`)
+    }
+    const dest = this.workspacePath(name)
+    if (!existsSync(dest)) {
+      this.materializeWorkspace(name, Oid.parse(record.savedRoot ?? record.baseTree))
+    }
+    return dest
+  }
+
+  // ---- garbage collection ----
+
+  // Removes objects that no reachable root references and that are older
+  // than the grace window, so an in-flight write is never reclaimed. Purely
+  // a reclamation pass: correctness never depends on it running.
+  gc(opts?: { graceMs?: number }): { removed: number; bytes: number; live: number } {
+    const graceMs = opts?.graceMs ?? 60 * 60 * 1000
+    const live = new Set<string>()
+    let ref: string | null = this.worldRef().data.head
+    while (ref) {
+      const record = this.worldRecord(ref)
+      live.add(ref.slice('blake3:'.length))
+      this.markTree(record.codeTree, live)
+      if (record.contextRoot) this.markContext(record.contextRoot, live)
+      ref = record.parent
+    }
+    for (const name of this.layerNames()) {
+      const record = this.layer(name)
+      if (record.publishedAs) {
+        live.add(record.publishedAs.slice('blake3:'.length))
+        const published = this.worldRecord(record.publishedAs)
+        this.markTree(published.codeTree, live)
+        if (published.contextRoot) this.markContext(published.contextRoot, live)
+      }
+      const root = record.savedRoot ?? record.baseTree
+      this.markTree(root, live)
+      for (const chunk of record.chunks) live.add(chunk.slice('blake3:'.length))
+      for (const sub of record.subtasks) {
+        for (const chunk of sub.chunks) live.add(chunk.slice('blake3:'.length))
+      }
+    }
+    const objectsDir = join(this.metaDir, 'objects')
+    const cutoff = Date.now() - graceMs
+    let removed = 0
+    let bytes = 0
+    if (existsSync(objectsDir)) {
+      for (const shard of readdirSync(objectsDir)) {
+        const shardDir = join(objectsDir, shard)
+        for (const rest of readdirSync(shardDir)) {
+          const file = join(shardDir, rest)
+          const hex = shard + rest
+          if (live.has(hex)) continue
+          const st = statSync(file)
+          if (st.mtimeMs > cutoff) continue
+          bytes += st.size
+          rmSync(file, { force: true })
+          removed++
+        }
+      }
+      for (const shard of readdirSync(objectsDir)) {
+        const shardDir = join(objectsDir, shard)
+        try {
+          if (readdirSync(shardDir).length === 0) rmdirSync(shardDir)
+        } catch {
+          // a concurrent writer recreated it; harmless
+        }
+      }
+    }
+    return { removed, bytes, live: live.size }
+  }
+
+  private markTree(ref: string, live: Set<string>): void {
+    const stack = [Oid.parse(ref)]
+    while (stack.length > 0) {
+      const treeId = stack.pop()!
+      const hex = treeId.hex
+      if (live.has(hex)) continue
+      live.add(hex)
+      const { leaves, dirs } = this.trees.readTree(treeId)
+      for (const leaf of leaves) live.add(leaf.oid.hex)
+      for (const dir of dirs) stack.push(dir.oid)
+    }
+  }
+
+  private markContext(ref: string, live: Set<string>): void {
+    live.add(ref.slice('blake3:'.length))
+    const { record } = this.store.getRecord('context-root', Oid.parse(ref))
+    const ctx = record as unknown as { chunks: string[]; subtasks: Array<{ chunks: string[] }> }
+    for (const chunk of ctx.chunks ?? []) live.add(chunk.slice('blake3:'.length))
+    for (const sub of ctx.subtasks ?? []) {
+      for (const chunk of sub.chunks ?? []) live.add(chunk.slice('blake3:'.length))
+    }
+  }
+
+  // ---- diagnostics and repair ----
+
+  // Checks the repository's structure and repairs what is safe to repair:
+  // a missing workspace is rematerialized from the sealed state, leftover
+  // staging and temp files from crashed runs are removed. It never touches
+  // canonical objects.
+  doctor(): { fixed: string[]; problems: string[] } {
+    const fixed: string[] = []
+    const problems: string[] = []
+    try {
+      let ref: string | null = this.worldRef().data.head
+      let guard = 1_000_000
+      while (ref && guard-- > 0) {
+        const record = this.worldRecord(ref)
+        ref = record.parent
+      }
+      if (guard <= 0) problems.push('world version chain does not terminate')
+    } catch (e) {
+      problems.push(`world chain: ${(e as Error).message}`)
+    }
+    for (const name of this.layerNames()) {
+      const record = this.layer(name)
+      if (record.status === 'published') continue
+      const dest = this.workspacePath(name)
+      if (!existsSync(dest)) {
+        try {
+          this.materializeWorkspace(name, Oid.parse(record.savedRoot ?? record.baseTree))
+          fixed.push(`rematerialized workspace for ${name}`)
+        } catch (e) {
+          problems.push(`workspace ${name}: ${(e as Error).message}`)
+        }
+      }
+    }
+    const workspaces = join(this.metaDir, 'workspaces')
+    if (existsSync(workspaces)) {
+      for (const entry of readdirSync(workspaces)) {
+        if (entry.includes('.staging-') || entry.includes('.tmp-')) {
+          rmSync(join(workspaces, entry), { recursive: true, force: true })
+          fixed.push(`removed leftover ${entry}`)
+        }
+      }
+    }
+    const layersDir = join(this.metaDir, 'refs', 'layers')
+    if (existsSync(layersDir)) {
+      for (const entry of readdirSync(layersDir)) {
+        if (entry.includes('.tmp-')) {
+          rmSync(join(layersDir, entry), { force: true })
+          fixed.push(`removed stale ref ${entry}`)
+        }
+      }
+    }
+    try {
+      this.timeline.read()
+    } catch (e) {
+      problems.push(`timeline: ${(e as Error).message}`)
+    }
+    const report = this.verify('quick')
+    problems.push(...report.problems)
+    return { fixed, problems }
   }
 
   // ---- idempotent operations ----
@@ -923,5 +1217,3 @@ function validateLayerName(name: string): void {
   }
   assertNoCollisions([name])
 }
-
-export { typedHash, Oid }

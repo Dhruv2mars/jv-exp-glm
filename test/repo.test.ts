@@ -1,6 +1,6 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test'
 import { join } from 'node:path'
-import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync, chmodSync, symlinkSync, appendFileSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync, chmodSync, symlinkSync, appendFileSync, readdirSync, utimesSync } from 'node:fs'
 import { Repo, RepositoryError } from '../src/core/repo.ts'
 import { objectCount } from '../src/core/objects.ts'
 import { Oid } from '../src/core/oids.ts'
@@ -408,6 +408,100 @@ describe('review regressions', () => {
     await repo.layerCreate('real')
     writeFileSync(join(dir, '.javelin', 'refs', 'layers', 'ghost.tmp-123-456'), 'junk')
     expect(repo.layerNames()).toEqual(['real'])
+  })
+})
+
+describe('workspace backend and maintenance', () => {
+  test('layer creation reuses the template cache and stays independent', async () => {
+    const { repo, dir } = await initRepo('cow-template', { 'a.txt': 'a\n', 'd/b.txt': 'b\n' })
+    await repo.layerCreate('one')
+    const cache = join(dir, '.javelin', 'cache', 'trees')
+    const templates = readdirSync(cache)
+    expect(templates).toHaveLength(1)
+    await repo.layerCreate('two')
+    expect(readdirSync(cache)).toHaveLength(1) // second create cloned, no new template
+    const wsOne = join(dir, '.javelin', 'workspaces', 'one')
+    const wsTwo = join(dir, '.javelin', 'workspaces', 'two')
+    writeFileSync(join(wsOne, 'a.txt'), 'edited\n')
+    expect(readFileSync(join(wsTwo, 'a.txt'), 'utf8')).toBe('a\n')
+    expect(readFileSync(join(cache, templates[0]!, 'a.txt'), 'utf8')).toBe('a\n')
+  })
+
+  test('the template cache is bounded', async () => {
+    const { repo, dir } = await initRepo('cow-prune', { 'a.txt': 'a\n' })
+    for (let i = 0; i < 6; i++) {
+      await repo.layerCreate(`l${i}`)
+      writeFileSync(join(dir, '.javelin', 'workspaces', `l${i}`, 'a.txt'), `v${i}\n`)
+      repo.seal(`l${i}`)
+      repo.publish(`l${i}`)
+    }
+    await repo.layerCreate('after')
+    const cache = join(dir, '.javelin', 'cache', 'trees')
+    expect(readdirSync(cache).length).toBeLessThanOrEqual(5)
+  })
+
+  test('the stat index keeps seal correct across scans', async () => {
+    const { repo, dir } = await initRepo('stat-index', { 'a.txt': 'v1\n', 'b.txt': 'b\n' })
+    await repo.layerCreate('work')
+    const ws = join(dir, '.javelin', 'workspaces', 'work')
+    writeFileSync(join(ws, 'a.txt'), 'v2\n')
+    repo.seal('work')
+    expect(repo.seal('work').changes.size).toBe(0)
+    // Same-size edit with a forged old mtime must still be detected.
+    writeFileSync(join(ws, 'b.txt'), 'B\n')
+    utimesSync(join(ws, 'b.txt'), 1000, 1000)
+    const changes = repo.seal('work').changes
+    expect([...changes.keys()]).toEqual(['b.txt'])
+    rmSync(join(ws, 'a.txt'))
+    expect([...repo.seal('work').changes.keys()]).toEqual(['a.txt'])
+  })
+
+  test('gc reclaims only unreachable objects and keeps the repository valid', async () => {
+    const { repo, dir } = await initRepo('gc-basics', { 'a.txt': 'a\n' })
+    await repo.layerCreate('kept')
+    writeFileSync(join(dir, '.javelin', 'workspaces', 'kept', 'unique-kept.txt'), 'keep me\n')
+    repo.seal('kept')
+    await repo.layerCreate('dropped')
+    writeFileSync(join(dir, '.javelin', 'workspaces', 'dropped', 'unique-dropped.txt'), 'drop me\n')
+    repo.seal('dropped')
+    repo.layerDelete('dropped')
+    const report = repo.gc({ graceMs: -1 })
+    expect(report.removed).toBeGreaterThan(0)
+    const blobs = [...repo.trees.listFiles(OidOf(repo.layer('kept').savedRoot!)).values()]
+    expect(repo.store.has(blobs[0]!.oid)).toBe(true)
+    expect(repo.verify('full')).toEqual({ ok: true, problems: [] })
+  })
+
+  test('init refuses a Git repository outright', async () => {
+    const { dir } = fresh('init-git-refusal')
+    writeFileSync(join(dir, 'a.txt'), 'a\n')
+    mkdirSync(join(dir, '.git'))
+    expect(Repo.init(dir)).rejects.toThrow('Git repository')
+  })
+
+  test('doctor repairs a missing workspace and clears leftovers', async () => {
+    const { repo, dir } = await initRepo('doctor-basics', { 'a.txt': 'a\n' })
+    await repo.layerCreate('w')
+    writeFileSync(join(dir, '.javelin', 'workspaces', 'w', 'a.txt'), 'sealed\n')
+    repo.seal('w')
+    rmSync(join(dir, '.javelin', 'workspaces', 'w'), { recursive: true, force: true })
+    mkdirSync(join(dir, '.javelin', 'workspaces', 'junk.staging-1'), { recursive: true })
+    const report = repo.doctor()
+    expect(report.problems).toEqual([])
+    expect(report.fixed.some((f) => f.includes('rematerialized workspace for w'))).toBe(true)
+    expect(readFileSync(join(dir, '.javelin', 'workspaces', 'w', 'a.txt'), 'utf8')).toBe('sealed\n')
+    expect(existsSync(join(dir, '.javelin', 'workspaces', 'junk.staging-1'))).toBe(false)
+  })
+
+  test('session traces containing credentials fail closed', async () => {
+    const { repo, dir } = await initRepo('trace-secrets', { 'a.txt': 'v1\n' })
+    await repo.layerCreate('bot')
+    repo.sessionStart('bot', { type: 'codex', sessionId: 's-sec' })
+    const trace = join(dir, 'leak.jsonl')
+    writeFileSync(trace, '{"env":"GITHUB_TOKEN=ghp_' + 'A'.repeat(36) + '"}\n')
+    expect(() => repo.sessionTrace('s-sec', trace)).toThrow('credentials')
+    expect(() => repo.sessionTrace('s-sec', trace, { allowSecrets: true })).not.toThrow()
+    expect(repo.layer('bot').chunks).toHaveLength(1)
   })
 })
 

@@ -88,6 +88,9 @@ const USAGE = `javelin - an agent-native version control system
   javelin show layer <name>
   javelin show event <id>
   javelin verify [--full]
+  javelin gc [--grace-hours n]
+  javelin doctor
+  javelin version
   javelin session start --layer <layer> --agent <type> --session <id>
   javelin session trace --session <id> --file <path>
   javelin session subagent --session <id> --task <id> --agent <type> [--file <path>] [--child-layer <name>]
@@ -168,6 +171,22 @@ export async function run(argv: string[], io: Io): Promise<number> {
         const report = repo.verify(bool(args, 'full') ? 'full' : 'quick')
         return emit(report.ok, { ok: report.ok, problems: report.problems })
       }
+      case 'gc': {
+        const repo = await needRepo()
+        const graceHours = num(str(args, 'grace-hours'))
+        const report = repo.gc({ ...(graceHours !== undefined ? { graceMs: graceHours * 3_600_000 } : {}) })
+        return emit(true, { ...report, bytesFreed: report.bytes, note: `removed ${report.removed} unreachable objects older than the grace window` })
+      }
+      case 'doctor': {
+        const repo = await needRepo()
+        const report = repo.doctor()
+        return emit(report.problems.length === 0, report)
+      }
+      case '--version':
+      case 'version': {
+        const pkg = await import('../../package.json', { with: { type: 'json' } })
+        return emit(true, { version: pkg.default.version })
+      }
       case 'session':
         return await sessionCommands(args, sub, needRepo, emit, fail)
       case undefined:
@@ -240,7 +259,8 @@ async function layerCommands(args: Args, sub: string | undefined, rest: string[]
       const repo = await needRepo()
       const record = repo.layer(name)
       if (record.status === 'published') return fail('published', `layer ${name} is published and read-only`, false)
-      return emit(true, { layer: name, path: repo.workspacePath(name) })
+      const path = repo.ensureWorkspace(name)
+      return emit(true, { layer: name, path })
     }
     case 'delete': {
       const name = rest[0]
@@ -335,7 +355,7 @@ async function sessionCommands(args: Args, sub: string | undefined, needRepo: Ne
       const session = str(args, 'session')
       const file = str(args, 'file')
       if (!session || !file) return fail('usage', 'usage: javelin session trace --session <id> --file <path>', false)
-      const record = repo.sessionTrace(session, file)
+      const record = repo.sessionTrace(session, file, { allowSecrets: bool(args, 'allow-secrets') })
       return emit(true, { layer: record.name, chunks: record.chunks.length })
     }
     case 'subagent': {
@@ -350,6 +370,7 @@ async function sessionCommands(args: Args, sub: string | undefined, needRepo: Ne
         agentType: agent,
         ...(file ? { tracePath: file } : {}),
         ...(childLayer ? { childLayer } : {}),
+        allowSecrets: bool(args, 'allow-secrets'),
       })
       return emit(true, { layer: record.name, subtasks: record.subtasks.length })
     }
@@ -474,6 +495,18 @@ function renderHuman(io: Io, commandName: string, ok: boolean, data: unknown): v
     case 'verify':
       io.stdout('ok: repository verified')
       break
+    case 'gc': {
+      const r = d as unknown as { removed: number; bytes: number }
+      io.stdout(`gc: removed ${r.removed} objects, reclaimed ${r.bytes} bytes`)
+      break
+    }
+    case 'doctor': {
+      const r = d as unknown as { fixed: string[]; problems: string[] }
+      for (const f of r.fixed) io.stdout(`fixed: ${f}`)
+      for (const p of r.problems) io.stderr(`problem: ${p}`)
+      if (r.fixed.length === 0 && r.problems.length === 0) io.stdout('ok: nothing to do')
+      break
+    }
     default:
       io.stdout(JSON.stringify(d, null, 2))
   }

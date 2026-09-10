@@ -216,6 +216,53 @@ describe('cli end to end', () => {
     expect(u.json().error.code).toBe('usage')
   })
 
+  test('gc, doctor, and version work through the cli', () => {
+    const dir = workspace('ops-cli')
+    writeFileSync(join(dir, 'a.txt'), 'v1\n')
+    javelin(dir, ['init'])
+    javelin(dir, ['layer', 'create', 'w'])
+    const ws = JSON.parse(javelin(dir, ['layer', 'open', 'w', '--json']).stdout).data.path
+    writeFileSync(join(ws, 'a.txt'), 'v2\n')
+    javelin(dir, ['layer', 'create', 'dropped'])
+    const droppedWs = JSON.parse(javelin(dir, ['layer', 'open', 'dropped', '--json']).stdout).data.path
+    writeFileSync(join(droppedWs, 'unique.txt'), 'x\n')
+    javelin(dir, ['layer', 'delete', 'dropped'])
+    rmSync(ws, { recursive: true, force: true })
+    const doc = javelin(dir, ['doctor', '--json'])
+    expect(doc.code).toBe(0)
+    expect(JSON.stringify(doc.json().data.fixed)).toContain('rematerialized workspace for w')
+    expect(existsSync(join(ws, 'a.txt'))).toBe(true)
+    const gc = javelin(dir, ['gc', '--grace-hours', '-1', '--json'])
+    expect(gc.code).toBe(0)
+    expect(gc.json().data.removed).toBeGreaterThan(0)
+    const version = javelin(dir, ['version', '--json'])
+    expect(version.json().data.version).toMatch(/^\d+\.\d+\.\d+/)
+  })
+
+  test('init refuses git repositories with a stable code', () => {
+    const dir = workspace('git-refusal')
+    writeFileSync(join(dir, 'a.txt'), 'a\n')
+    mkdirSync(join(dir, '.git'))
+    const r = javelin(dir, ['init', '--json'])
+    expect(r.code).toBe(1)
+    expect(r.json().error.code).toBe('git-repository')
+  })
+
+  test('traces with credentials fail closed unless --allow-secrets', () => {
+    const dir = workspace('secret-cli')
+    writeFileSync(join(dir, 'a.txt'), 'v1\n')
+    javelin(dir, ['init'])
+    javelin(dir, ['layer', 'create', 'bot'])
+    javelin(dir, ['session', 'start', '--layer', 'bot', '--agent', 'codex', '--session', 'sx'])
+    const trace = join(dir, 'leak.jsonl')
+    writeFileSync(trace, 'token=ghp_' + 'B'.repeat(36) + '\n')
+    const denied = javelin(dir, ['session', 'trace', '--session', 'sx', '--file', trace, '--json'])
+    expect(denied.code).toBe(1)
+    expect(denied.json().error.code).toBe('trace-secrets')
+    const allowed = javelin(dir, ['session', 'trace', '--session', 'sx', '--file', trace, '--allow-secrets', '--json'])
+    expect(allowed.code).toBe(0)
+  })
+
   test('human output renders the core verbs', () => {
     const dir = workspace('human')
     writeFileSync(join(dir, 'a.txt'), 'v1\n')
