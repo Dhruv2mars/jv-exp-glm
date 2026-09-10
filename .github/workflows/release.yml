@@ -1,0 +1,100 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions: {}
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: tag must match package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          local_v="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$local_v" ]; then
+            echo "tag v$tag does not match package version $local_v" >&2
+            exit 1
+          fi
+      - run: bun install
+      - run: bun run typecheck
+      - run: bun test
+
+  create_release:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: create the release idempotently
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "jv-cli-exp $GITHUB_REF_NAME" --generate-notes
+
+  build_upload:
+    needs: create_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - target: bun-darwin-arm64
+            name: javelin-darwin-arm64
+          - target: bun-darwin-x64
+            name: javelin-darwin-x64
+          - target: bun-linux-x64
+            name: javelin-linux-x64
+          - target: bun-linux-arm64
+            name: javelin-linux-arm64
+          - target: bun-windows-x64
+            name: javelin-windows-x64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install
+      - run: bun build src/cli/main.ts --compile --target=${{ matrix.target }} --outfile ${{ matrix.name }}
+      - name: checksum and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          gh release upload "$GITHUB_REF_NAME" ${{ matrix.name }} ${{ matrix.name }}.sha256 --clobber
+
+  publish_npm:
+    needs: build_upload
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: publish with trusted publishing
+        run: |
+          set -euo pipefail
+          local_v="$(node -p "require('./package.json').version")"
+          remote_v="$(npm view jv-cli-exp version 2>/dev/null || true)"
+          if [ -n "${remote_v:-}" ] && [ "${remote_v}" = "${local_v}" ]; then
+            echo "skip: already on npm (${remote_v})"
+            exit 0
+          fi
+          rc="${RUNNER_TEMP:-/tmp}/npmrc"
+          echo "registry=https://registry.npmjs.org/" > "$rc"
+          export NPM_CONFIG_USERCONFIG="$rc"
+          unset NODE_AUTH_TOKEN || true
+          npm install
+          npm publish --provenance --access public

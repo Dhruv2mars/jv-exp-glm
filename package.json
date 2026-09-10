@@ -41,7 +41,6 @@
     "cli",
     "javelin"
   ],
-  "prepublishOnly": "bun test",
   "publishConfig": {
     "access": "public"
   }
